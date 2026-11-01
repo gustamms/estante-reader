@@ -42,7 +42,7 @@ O marco 0.1 descreve a base manual inicial. A implementação atual adiciona est
 
 ### Estado verificado em 1 de novembro de 2026
 
-- Repositório local: `/Users/gustavomendes/Documents/develop/estante-reader`.
+- Repositório local: checkout do projeto no ambiente de desenvolvimento.
 - Ambiente: Java 17, SDK Android 36 e emulador ARM64. A compilação com Gradle Wrapper gerou APKs debug por arquitetura; o APK ARM64 tem aproximadamente 66 MiB.
 - O projeto integra um detector ONNX local com revisão fixada, licença/avisos e conferência de SHA-256 do modelo. A inferência ainda precisa ser exercitada com um CBZ real.
 - Ao abrir um CBZ, a análise prioriza a página atual e as duas seguintes, depois percorre as demais. Cada página concluída é persistida atomicamente e identificada pelo conteúdo do arquivo e versão do modelo.

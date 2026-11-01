@@ -6,3 +6,9 @@ local.properties
 captures/
 .externalNativeBuild/
 .cxx/
+# Local Android signing material. Never commit private signing keys.
+key.properties
+*.jks
+*.keystore
+*.p12
+*.pfx
