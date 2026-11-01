@@ -83,6 +83,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -219,20 +220,32 @@ private fun LibraryScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Column {
-                    Text(
-                        text = "ESTANTE",
-                        color = Olive,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 2.sp,
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.estante_logo),
+                        contentDescription = null,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.size(40.dp),
                     )
-                    Text(
-                        text = "Sua próxima leitura.",
-                        color = Ink,
-                        fontSize = 27.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "ESTANTE",
+                            color = Olive,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 2.sp,
+                        )
+                        Text(
+                            text = "Sua próxima leitura.",
+                            color = Ink,
+                            fontSize = 25.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
                 }
                 Button(
                     onClick = onImport,
