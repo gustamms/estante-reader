@@ -1,6 +1,8 @@
 package com.estante.reader.core.publication
 
 import java.io.File
+import java.net.URLConnection
+import java.util.Locale
 
 enum class PublicationContentKind { PAGED, REFLOWABLE_TEXT }
 enum class BookColumnMode(val id: String) {
@@ -21,6 +23,23 @@ data class PublicationCapabilities(
 )
 
 data class PublicationChapter(val href: String, val title: String)
+
+internal object PublicationResourceMimeType {
+    fun resolve(relativePath: String, chapters: List<PublicationChapter>): String {
+        if (chapters.any { it.href == relativePath }) return "text/html"
+
+        val extension = relativePath.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        return when (extension) {
+            "html", "htm", "xhtml" -> "text/html"
+            "opf", "ncx", "xml" -> "application/xml"
+            "css" -> "text/css"
+            "svg" -> "image/svg+xml"
+            "woff", "woff2", "ttf", "otf" -> "font/$extension"
+            else -> URLConnection.guessContentTypeFromName(relativePath) ?: "application/octet-stream"
+        }
+    }
+}
+
 data class PublicationBookmark(val chapterIndex: Int, val progression: Float, val title: String)
 data class PublicationSearchResult(val chapterIndex: Int, val progression: Float, val title: String, val snippet: String)
 

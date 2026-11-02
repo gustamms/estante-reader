@@ -67,10 +67,9 @@ import com.estante.reader.core.publication.PublicationChapter
 import com.estante.reader.core.publication.PublicationCapabilities
 import com.estante.reader.core.publication.PublicationSearchResult
 import com.estante.reader.core.publication.BookColumnMode
+import com.estante.reader.core.publication.PublicationResourceMimeType
 import java.io.File
-import java.net.URLConnection
 import java.net.URLDecoder
-import java.util.Locale
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -122,6 +121,7 @@ internal fun BookReaderScreen(
     var searchQuery by remember(bookId) { mutableStateOf("") }
     val chapter = chapters.getOrNull(chapterIndex)
     val chapterCount = chapters.size.coerceAtLeast(1)
+    var chapterLoadError by remember(bookId, chapter?.href) { mutableStateOf<String?>(null) }
     val chapterUrl = remember(bookId, chapter?.href) {
         "https://reader.estante.local/book/$bookId/${Uri.encode(chapter?.href.orEmpty(), "/-_.~")}"
     }
@@ -200,6 +200,8 @@ internal fun BookReaderScreen(
                     highlights = { latestHighlights },
                     pendingHighlight = { latestPendingHighlight },
                     onPendingHighlightConsumed = { id -> latestOnPendingConsumed(id) },
+                    onChapterLoadStarted = { chapterLoadError = null },
+                    onChapterLoadError = { message -> chapterLoadError = message },
                 )
                 var downX = 0f
                 var downY = 0f
@@ -235,6 +237,31 @@ internal fun BookReaderScreen(
             }
         },
     )
+
+    chapterLoadError?.let { message ->
+        Surface(
+            modifier = Modifier.align(Alignment.Center).padding(24.dp),
+            color = Color(0xFFF6F2EA),
+            shape = RoundedCornerShape(20.dp),
+            shadowElevation = 12.dp,
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Não foi possível abrir este capítulo", color = Color(0xFF292722), fontSize = 18.sp)
+                Text(message, color = Color(0xFF625B50), fontSize = 14.sp)
+                Button(
+                    onClick = {
+                        chapterLoadError = null
+                        webView.value?.reload()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFA95138)),
+                ) { Text("Tentar novamente") }
+            }
+        }
+    }
 
     DisposableEffect(webView.value) {
         onDispose {
@@ -549,6 +576,8 @@ private class BookWebViewClient(
     private val highlights: () -> List<BookHighlightEntity>,
     private val pendingHighlight: () -> BookHighlightEntity?,
     private val onPendingHighlightConsumed: (String) -> Unit,
+    private val onChapterLoadStarted: () -> Unit,
+    private val onChapterLoadError: (String) -> Unit,
 ) : WebViewClient() {
     private val prefix = "/book/$bookId/"
     private val canonicalRoot = root.canonicalFile
@@ -564,14 +593,7 @@ private class BookWebViewClient(
         if (!file.path.startsWith(canonicalRoot.path + File.separator) || !file.isFile || file.length() > 24L * 1024 * 1024) {
             return response("text/plain", "Arquivo não encontrado.", 404)
         }
-        val mimeType = URLConnection.guessContentTypeFromName(file.name) ?: when (file.extension.lowercase(Locale.ROOT)) {
-            "xhtml", "html", "htm" -> "application/xhtml+xml"
-            "opf", "ncx", "xml" -> "application/xml"
-            "css" -> "text/css"
-            "svg" -> "image/svg+xml"
-            "woff", "woff2", "ttf", "otf" -> "font/${file.extension.lowercase(Locale.ROOT)}"
-            else -> "application/octet-stream"
-        }
+        val mimeType = PublicationResourceMimeType.resolve(relative, chapters)
         return runCatching {
             WebResourceResponse(mimeType, "UTF-8", file.inputStream())
         }.getOrElse { response("text/plain", "Não foi possível carregar este recurso.", 404) }
@@ -595,6 +617,30 @@ private class BookWebViewClient(
             val target = pendingHighlight()?.takeIf { it.chapterIndex == chapter }
             applyReaderStyle(style(), chapter, highlights(), target, onPendingHighlightConsumed)
             if (target == null) postDelayed({ scrollToProgress(progression()) }, 120)
+        }
+    }
+
+    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+        if (url?.startsWith("https://reader.estante.local$prefix") == true) onChapterLoadStarted()
+    }
+
+    override fun onReceivedError(
+        view: WebView?,
+        request: WebResourceRequest,
+        error: android.webkit.WebResourceError,
+    ) {
+        if (request.isForMainFrame) {
+            onChapterLoadError("O conteúdo do capítulo não pôde ser carregado. Verifique se o arquivo do livro ainda está disponível.")
+        }
+    }
+
+    override fun onReceivedHttpError(
+        view: WebView?,
+        request: WebResourceRequest,
+        errorResponse: WebResourceResponse,
+    ) {
+        if (request.isForMainFrame && errorResponse.statusCode >= 400) {
+            onChapterLoadError("O arquivo deste capítulo não foi encontrado. Reimporte o livro para tentar novamente.")
         }
     }
 
