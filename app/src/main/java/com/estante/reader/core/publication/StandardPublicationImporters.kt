@@ -104,11 +104,7 @@ class EpubImporter : PublicationImporter {
                 }
                 if (chapters.isEmpty()) throw UnsupportedPublicationException("Este EPUB não tem capítulos de texto compatíveis.")
 
-                val coverItem = manifest.values.firstOrNull { it.attr("properties").split(Regex("\\s+")).contains("cover-image") }
-                    ?: metadata?.elements("meta")?.firstOrNull { it.attr("name") == "cover" }
-                        ?.let { meta -> manifest[meta.attr("content")] }
-                val cover = coverItem?.let { safeFile(destination, joinPath(opfDirectory, it.attr("href"))) }
-                    ?.takeIf { it.isFile && it.length() in 1..MAX_COVER_BYTES }
+                val cover = PublicationCoverResolver.find(destination)
 
                 return ImportedPublication(formatId, title, author, chapters, destination, cover)
             }

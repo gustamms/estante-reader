@@ -190,7 +190,20 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         viewModelScope.launch {
+            val attemptedCovers = mutableSetOf<String>()
             libraryRepository.observeLibrary().collect { comics ->
+                comics.filter { it.format == ComicFormat.EPUB && (it.coverPath == null || !File(application.filesDir, it.coverPath).isFile) }.forEach { book ->
+                    if (attemptedCovers.add(book.id)) withContext(Dispatchers.IO) {
+                        runCatching {
+                            val root = File(application.filesDir, "library/publications/${book.id}")
+                            val cover = com.estante.reader.core.publication.PublicationCoverResolver.find(root) ?: return@runCatching
+                            val relative = "library/covers/${book.id}.jpg"
+                            writeCoverThumbnail(cover.readBytes(), File(application.filesDir, relative))
+                            PublicationManifestStore.load(root)?.copy(coverFile = cover)?.let(PublicationManifestStore::save)
+                            libraryRepository.updateCover(book.id, 0, relative)
+                        }
+                    }
+                }
                 _libraryItems.value = comics.map { comic ->
                     LibraryComicUi(
                         id = comic.id,
@@ -430,7 +443,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             installedRoot = publicationTarget
             val installed = parsed.copy(
                 root = publicationTarget,
-                coverFile = parsed.coverFile?.let { File(publicationTarget, it.relativeTo(publicationStage).path) },
+                coverFile = parsed.coverFile?.let { File(publicationTarget, it.canonicalFile.relativeTo(publicationStage.canonicalFile).path) },
             )
             PublicationManifestStore.save(installed)
             val coverRelative = installed.coverFile?.let { cover ->

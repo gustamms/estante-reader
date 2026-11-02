@@ -12,8 +12,8 @@ android {
         applicationId = "com.estante.reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.1.0-alpha.7"
+        versionCode = 8
+        versionName = "0.1.0-alpha.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

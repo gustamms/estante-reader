@@ -12,7 +12,9 @@ object PublicationManifestStore {
         publication.chapters.forEach { chapter ->
             chapters.put(JSONObject().put("href", chapter.href).put("title", chapter.title))
         }
-        val coverPath = publication.coverFile?.relativeToOrNull(publication.root)?.path
+        val coverPath = publication.coverFile?.canonicalFile
+            ?.takeIf { it.path.startsWith(publication.root.canonicalPath + File.separator) }
+            ?.relativeTo(publication.root.canonicalFile)?.path
         val json = JSONObject()
             .put("version", 1)
             .put("format", publication.formatId)

@@ -121,6 +121,7 @@ internal fun BookReaderScreen(
     var searchQuery by remember(bookId) { mutableStateOf("") }
     val chapter = chapters.getOrNull(chapterIndex)
     val chapterCount = chapters.size.coerceAtLeast(1)
+    var visiblePage by remember(bookId, chapter?.href) { mutableStateOf(1 to 1) }
     var chapterLoadError by remember(bookId, chapter?.href) { mutableStateOf<String?>(null) }
     val chapterUrl = remember(bookId, chapter?.href) {
         "https://reader.estante.local/book/$bookId/${Uri.encode(chapter?.href.orEmpty(), "/-_.~")}"
@@ -172,6 +173,8 @@ internal fun BookReaderScreen(
             WebView(viewContext).apply {
                 setBackgroundColor(background.color.toArgb())
                 settings.javaScriptEnabled = true
+                settings.useWideViewPort = true
+                settings.loadWithOverviewMode = false
                 settings.domStorageEnabled = false
                 settings.allowFileAccess = false
                 settings.allowContentAccess = false
@@ -179,9 +182,14 @@ internal fun BookReaderScreen(
                 settings.builtInZoomControls = false
                 settings.displayZoomControls = false
                 settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                addJavascriptInterface(BookProgressBridge { reportedChapter, value ->
-                    latestOnProgress(reportedChapter, value)
-                }, "EstanteProgress")
+                addJavascriptInterface(BookProgressBridge(
+                    report = { reportedChapter, value -> post { latestOnProgress(reportedChapter, value) } },
+                    turnChapter = { direction -> post {
+                        val next = latestChapterIndex + direction
+                        if (next in chapters.indices) latestOnProgress(next, if (direction > 0) 0f else 1f)
+                    } },
+                    pagination = { page, total -> post { visiblePage = page to total } },
+                ), "EstanteProgress")
                 addJavascriptInterface(BookSelectionBridge(
                     reportSelection = { href, text, start, end, prefix, suffix ->
                         latestOnTextSelection(href, text, start, end, prefix, suffix)
@@ -214,8 +222,14 @@ internal fun BookReaderScreen(
                             downTime = event.eventTime
                         }
                         android.view.MotionEvent.ACTION_UP -> {
+                            val dx = event.x - downX
+                            val dy = event.y - downY
                             val moved = kotlin.math.abs(event.x - downX) > 12 || kotlin.math.abs(event.y - downY) > 12
                             val quickTap = event.eventTime - downTime < 280
+                            if (quickTap && !moved && !latestControlsVisible && (event.x < width * 0.25f || event.x > width * 0.75f)) {
+                                evaluateJavascript("if(window.getSelection().isCollapsed && window.estanteTurnPage) window.estanteTurnPage(${if (event.x > width * 0.75f) 1 else -1});", null)
+                                return@setOnTouchListener true
+                            }
                             if (quickTap && !moved && event.x in width * 0.30f..width * 0.70f && event.y in height * 0.34f..height * 0.68f) {
                                 latestToggleControls(!latestControlsVisible)
                                 return@setOnTouchListener true
@@ -324,17 +338,17 @@ internal fun BookReaderScreen(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton(
-                        onClick = { latestOnGoToChapter((chapterIndex - 1).coerceAtLeast(0)) },
-                        enabled = chapterIndex > 0,
+                        onClick = { webView.value?.evaluateJavascript("window.estanteTurnPage?.(-1)", null) },
+                        enabled = chapterIndex > 0 || visiblePage.first > 1,
                         colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFA95138)),
                     ) { Text("Anterior") }
                     Text(
-                        text = "${chapterIndex + 1} / $chapterCount  ·  ${(progression * 100).toInt()}%",
+                        text = "Página ${visiblePage.first} de ${visiblePage.second} · Capítulo ${chapterIndex + 1} de $chapterCount",
                         color = Color(0xFF292722), modifier = Modifier.weight(1f), fontSize = 13.sp,
                     )
                     TextButton(
-                        onClick = { latestOnGoToChapter((chapterIndex + 1).coerceAtMost(chapterCount - 1)) },
-                        enabled = chapterIndex < chapterCount - 1,
+                        onClick = { webView.value?.evaluateJavascript("window.estanteTurnPage?.(1)", null) },
+                        enabled = chapterIndex < chapterCount - 1 || visiblePage.first < visiblePage.second,
                         colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFA95138)),
                     ) { Text("Próximo") }
                 }
@@ -347,7 +361,7 @@ internal fun BookReaderScreen(
                         val newProgress = if (newIndex == chapterCount - 1 && value >= 1f) 1f else absolute - newIndex
                         if (newIndex == chapterIndex) {
                             webView.value?.evaluateJavascript(
-                                "window.scrollTo(0, Math.max(0, (document.documentElement.scrollHeight - window.innerHeight) * $newProgress));",
+                                "window.estanteRestoreProgress?.($newProgress);",
                                 null,
                             )
                         }
@@ -527,7 +541,7 @@ internal fun BookReaderScreen(
     }
 }
 
-private data class ReaderWebStyle(
+internal data class ReaderWebStyle(
     val fontSizeSp: Float,
     val twoColumns: Boolean,
     val background: ReaderCanvasBackground,
@@ -535,7 +549,14 @@ private data class ReaderWebStyle(
     val marginsDp: Float,
 )
 
-private class BookProgressBridge(private val report: (Int, Float) -> Unit) {
+private class BookProgressBridge(
+    private val report: (Int, Float) -> Unit,
+    private val turnChapter: (Int) -> Unit,
+    private val pagination: (Int, Int) -> Unit,
+) {
+    @JavascriptInterface fun onChapterBoundary(direction: Int) { if (direction == -1 || direction == 1) turnChapter(direction) }
+    @JavascriptInterface fun onPagination(page: Int, total: Int) { if (page in 1..total) pagination(page, total) }
+
     @JavascriptInterface
     fun onProgress(chapterIndex: Int, progression: Float) {
         report(chapterIndex, progression)
@@ -596,7 +617,12 @@ private class BookWebViewClient(
         }
         val mimeType = PublicationResourceMimeType.resolve(relative, chapters)
         return runCatching {
-            WebResourceResponse(mimeType, "UTF-8", file.inputStream())
+            // Standards mode is required for viewport sizing and horizontal page overflow.
+            // This also repairs chapters imported by older versions without a doctype.
+            val content = if (mimeType == "text/html") {
+                java.io.SequenceInputStream("<!doctype html>\n".byteInputStream(), file.inputStream())
+            } else file.inputStream()
+            WebResourceResponse(mimeType, "UTF-8", content)
         }.getOrElse { response("text/plain", "Não foi possível carregar este recurso.", 404) }
     }
 
@@ -655,7 +681,7 @@ private class BookWebViewClient(
     )
 }
 
-private fun WebView.applyReaderStyle(
+internal fun WebView.applyReaderStyle(
     style: ReaderWebStyle,
     chapterIndex: Int,
     highlights: List<BookHighlightEntity>,
@@ -664,8 +690,8 @@ private fun WebView.applyReaderStyle(
 ) {
     val background = style.background.color.toArgb().toUInt().toString(16).padStart(8, '0').takeLast(6)
     val text = if (style.background == ReaderCanvasBackground.DARK) "#F2EEE6" else "#292722"
-    val columns = if (style.twoColumns) "column-count:2;column-gap:30px;" else "column-count:1;"
-    val css = """html,body{background:#$background!important;color:$text!important;}body{font-family:Georgia,'Noto Serif',serif!important;font-size:${style.fontSizeSp}px!important;line-height:${style.lineSpacing}!important;max-width:900px;margin:0 auto!important;padding:28px ${style.marginsDp}px 120px!important;box-sizing:border-box;$columns}img,svg,video{max-width:100%!important;height:auto!important;}a{color:#A95138!important;}.estante-highlight{color:inherit!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:.15em;-webkit-tap-highlight-color:transparent;}.estante-highlight-focus{outline:2px solid #A95138;outline-offset:2px;}"""
+    val columnCount = if (style.twoColumns) 2 else 1
+    val css = """html{height:100%;overflow:hidden!important;}html,body{background:#$background!important;color:$text!important;}body{font-family:Georgia,'Noto Serif',serif!important;font-size:${style.fontSizeSp}px!important;line-height:${style.lineSpacing}!important;width:100vw!important;max-width:none!important;height:100vh!important;min-height:0!important;margin:0!important;padding:28px ${style.marginsDp}px!important;box-sizing:border-box;column-count:$columnCount!important;column-gap:${style.marginsDp * 2}px!important;column-fill:auto!important;overflow:visible!important;}img,svg,video{max-width:100%!important;max-height:calc(100vh - 56px)!important;height:auto!important;object-fit:contain;}a{color:#A95138!important;}.estante-highlight{color:inherit!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:.15em;-webkit-tap-highlight-color:transparent;}.estante-highlight-focus{outline:2px solid #A95138;outline-offset:2px;}"""
     val chapterHighlights = highlights.asSequence().filter { it.chapterIndex == chapterIndex }.map { item ->
         org.json.JSONObject()
             .put("id", item.id)
@@ -680,11 +706,22 @@ private fun WebView.applyReaderStyle(
     val target = pendingHighlight?.takeIf { it.chapterIndex == chapterIndex }?.id?.let(org.json.JSONObject::quote) ?: "null"
     val script = """
         (function(){
+          var viewport=document.querySelector('meta[name=viewport]');if(!viewport){viewport=document.createElement('meta');viewport.name='viewport';document.head.appendChild(viewport);}viewport.content='width=device-width,initial-scale=1';
           var style=document.getElementById('estante-reader-style');
           if(!style){style=document.createElement('style');style.id='estante-reader-style';document.head.appendChild(style);}
-          style.textContent=${org.json.JSONObject.quote(css)};
+          var pager=document.getElementById('estante-pages'),content=document.getElementById('estante-content');
+          if(!pager){pager=document.createElement('div');pager.id='estante-pages';content=document.createElement('div');content.id='estante-content';while(document.body.firstChild)content.appendChild(document.body.firstChild);pager.appendChild(content);document.body.appendChild(pager);}
+          function layoutPages(){var v=window.visualViewport;var w=v?v.width:document.documentElement.clientWidth;var h=v?v.height:document.documentElement.clientHeight;window.estantePageWidth=Math.max(1,w);style.textContent=${org.json.JSONObject.quote(css)}+'html,body{width:'+w+'px!important;height:'+h+'px!important;}body{padding:0!important;column-count:auto!important;overflow:hidden!important;}#estante-pages{position:relative;width:100%;height:100%;overflow:hidden;}#estante-content{width:100%;height:100%;box-sizing:border-box;padding:28px ${style.marginsDp}px;column-count:$columnCount;column-gap:${style.marginsDp * 2}px;column-fill:auto;}img,svg,video{max-height:'+Math.max(1,h-56)+'px!important;}';}
+          window.estanteLayoutPages=layoutPages;layoutPages();
           if(window.estanteProgressTimer){clearInterval(window.estanteProgressTimer);}
-          window.estanteProgressTimer=setInterval(function(){var e=document.documentElement;var h=Math.max(0,e.scrollHeight-window.innerHeight);var p=h>0?window.scrollY/h:0;EstanteProgress.onProgress($chapterIndex,Math.max(0,Math.min(1,p)));},1200);
+          function pageCount(){var count=Math.max(1,Math.ceil((content.scrollWidth-1)/window.estantePageWidth));var end=document.getElementById('estante-page-end');if(!end){end=document.createElement('div');end.id='estante-page-end';end.setAttribute('aria-hidden','true');pager.appendChild(end);}end.style.cssText='position:absolute;top:0;left:'+(count*window.estantePageWidth-1)+'px;width:1px;height:1px;pointer-events:none;';return count;}
+          function reportPage(){var count=pageCount(),page=Math.min(count-1,Math.round(pager.scrollLeft/window.estantePageWidth));window.estanteProgressValue=count>1?page/(count-1):0;EstanteProgress.onPagination(page+1,count);EstanteProgress.onProgress($chapterIndex,window.estanteProgressValue);}
+          window.estanteRestoreProgress=function(p){var page=Math.round(Math.max(0,Math.min(1,p))*(pageCount()-1));pager.scrollTo({left:page*window.estantePageWidth,top:0,behavior:'instant'});reportPage();};
+          window.estanteTurnPage=function(direction){var next=Math.round(pager.scrollLeft/window.estantePageWidth)+direction,count=pageCount();if(next<0||next>=count){EstanteProgress.onChapterBoundary(direction);return;}pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});clearTimeout(window.estanteTurnTimer);window.estanteTurnTimer=setTimeout(function(){pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:'instant'});reportPage();},350);};
+          window.estanteProgressTimer=setInterval(reportPage,1200);
+          if(!window.estanteSwipeListener){var startX=0,startY=0,startTime=0;document.addEventListener('touchstart',function(e){if(e.touches.length!==1)return;startX=e.touches[0].clientX;startY=e.touches[0].clientY;startTime=Date.now();},{passive:true});document.addEventListener('touchend',function(e){if(!e.changedTouches.length)return;var dx=e.changedTouches[0].clientX-startX,dy=e.changedTouches[0].clientY-startY;if(Date.now()-startTime<600&&Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)*1.5&&getSelection().isCollapsed){e.preventDefault();window.estanteTurnPage(dx<0?1:-1);}},{passive:false});window.estanteSwipeListener=true;}
+          if(!window.estanteResizeHandler){window.estanteResizeHandler=function(){var p=window.estanteProgressValue||0;window.estanteLayoutPages();requestAnimationFrame(function(){window.estanteRestoreProgress(p);});};addEventListener('resize',window.estanteResizeHandler);}
+          requestAnimationFrame(function(){EstanteProgress.onPagination(Math.round(pager.scrollLeft/window.estantePageWidth)+1,pageCount());});
           document.querySelectorAll('[data-estante-highlight]').forEach(function(mark){var parent=mark.parentNode;if(!parent)return;while(mark.firstChild)parent.insertBefore(mark.firstChild,mark);parent.removeChild(mark);});
           if(document.body)document.body.normalize();
           var items=JSON.parse($encodedHighlights);
@@ -701,7 +738,7 @@ private fun WebView.applyReaderStyle(
           });
           if($target){
             var focused=document.querySelector('[data-estante-highlight="'+$target+'"]');
-            if(focused){focused.classList.add('estante-highlight-focus');focused.scrollIntoView({block:'center',behavior:'smooth'});setTimeout(function(){focused.classList.remove('estante-highlight-focus');},1500);EstanteHighlights.onHighlightVisible($target);}
+            if(focused){focused.classList.add('estante-highlight-focus');focused.scrollIntoView({block:'nearest',inline:'start'});pager.scrollTo({left:Math.floor(pager.scrollLeft/window.estantePageWidth)*window.estantePageWidth,top:0});reportPage();setTimeout(function(){focused.classList.remove('estante-highlight-focus');},1500);EstanteHighlights.onHighlightVisible($target);}
           }
           function selectionHref(){var path=decodeURIComponent(location.pathname||'');var parts=path.split('/');return parts.length>3&&parts[1]==='book'?parts.slice(3).join('/'):'';}
           function offsetAt(container,offset){var range=document.createRange();range.selectNodeContents(document.body);range.setEnd(container,offset);return range.toString().length;}
@@ -727,7 +764,7 @@ private fun WebView.applyReaderStyle(
 
 private fun WebView.scrollToProgress(progression: Float) {
     evaluateJavascript(
-        "window.scrollTo(0, Math.max(0, (document.documentElement.scrollHeight - window.innerHeight) * ${progression.coerceIn(0f, 1f)}));",
+        "window.estanteRestoreProgress?.(${progression.coerceIn(0f, 1f)});",
         null,
     )
 }
