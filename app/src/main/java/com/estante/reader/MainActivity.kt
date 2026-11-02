@@ -20,9 +20,6 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
@@ -56,10 +53,10 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
@@ -67,18 +64,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -93,6 +86,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -102,6 +96,11 @@ import com.estante.reader.core.guided.NormalizedRect
 import com.estante.reader.core.reader.PageDisplayMode
 import com.estante.reader.core.reader.ReaderSpread
 import com.estante.reader.core.reader.ReaderSpreadBuilder
+import eu.wewox.pagecurl.ExperimentalPageCurlApi
+import eu.wewox.pagecurl.config.PageCurlConfig
+import eu.wewox.pagecurl.config.rememberPageCurlConfig
+import eu.wewox.pagecurl.page.PageCurl
+import eu.wewox.pagecurl.page.PageCurlState
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -187,6 +186,7 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             onSetSeparateCover = viewModel::setSeparateCover,
             onSetPanoramasAlone = viewModel::setPanoramasAlone,
             onLoadSpreadPage = viewModel::loadSpreadPage,
+            onLoadNeighborSpreads = viewModel::loadNeighborSpreads,
         )
     } else {
         LibraryScreen(
@@ -270,7 +270,7 @@ private fun LibraryScreen(
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("Sua estante está vazia", color = Ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
-                        Text("Adicione quadrinhos CBZ ou CBR para começar.", color = Muted, textAlign = TextAlign.Center)
+                        Text("Adicione quadrinhos em PDF, CBZ ou CBR para começar.", color = Muted, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(16.dp))
                         Button(onClick = onImport, colors = ButtonDefaults.buttonColors(containerColor = Terracotta)) { Text("Adicionar quadrinho") }
                     }
@@ -341,6 +341,7 @@ private fun LibraryCover(path: String?, title: String) {
 }
 
 @Composable
+@OptIn(ExperimentalPageCurlApi::class)
 private fun ComicReaderScreen(
     state: ReaderUiState,
     onClose: () -> Unit,
@@ -365,6 +366,7 @@ private fun ComicReaderScreen(
     onSetSeparateCover: (Boolean) -> Unit = {},
     onSetPanoramasAlone: (Boolean) -> Unit = {},
     onLoadSpreadPage: (Int?) -> Unit = {},
+    onLoadNeighborSpreads: (Int?, Int?) -> Unit = { _, _ -> },
 ) {
     val clipboard = LocalContext.current.getSystemService(ClipboardManager::class.java)
     val context = LocalContext.current
@@ -374,28 +376,7 @@ private fun ComicReaderScreen(
     var lensVisible by remember(state.title, state.pageIndex) { mutableStateOf(false) }
     var lensPageIndex by remember(state.title, state.pageIndex) { mutableIntStateOf(state.pageIndex) }
     var companionActiveRegion by remember(state.title, state.pageIndex) { mutableIntStateOf(0) }
-    var spreadDragAngle by remember(state.title, state.pageIndex) { mutableFloatStateOf(0f) }
-    var spreadTurnPending by remember(state.title) { mutableIntStateOf(-1) }
-    val spreadTurnAngle = remember(state.title) { Animatable(0f) }
-    val spreadTurnScope = rememberCoroutineScope()
-    LaunchedEffect(state.pageIndex, state.error) {
-        if (spreadTurnPending >= 0 && (state.pageIndex == spreadTurnPending || state.error != null)) {
-            spreadTurnAngle.animateTo(0f, tween(180))
-            spreadDragAngle = 0f
-            spreadTurnPending = -1
-        }
-    }
-    val turnToSpread: (Int, Boolean) -> Unit = { target, towardNext ->
-        val nextIsLeftToRight = (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) == towardNext
-        val endAngle = if (nextIsLeftToRight) -78f else 78f
-        spreadTurnPending = target
-        spreadTurnScope.launch {
-            spreadTurnAngle.snapTo(spreadDragAngle)
-            spreadTurnAngle.animateTo(endAngle, tween(180))
-            spreadDragAngle = 0f
-            onPageChange(target)
-        }
-    }
+    val pageTurnScope = rememberCoroutineScope()
     BackHandler {
         when {
             controlsVisible -> controlsVisible = false
@@ -444,6 +425,78 @@ private fun ComicReaderScreen(
                 if (state.pageIndex == baseSpread.first) companionIndex
                 else ReaderSpreadBuilder.next(baseSpread, state.pageCount, state.separateCover)
             } else displaySpread?.let { ReaderSpreadBuilder.next(it, state.pageCount, state.separateCover) }
+            val pageTurnState = remember(state.title, state.pageIndex, doublePage) {
+                PageCurlState(initialMax = 3, initialCurrent = 1)
+            }
+            val isLeftToRight = state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT
+            val leftHalf = Rect(0f, 0f, 0.5f, 1f)
+            val rightHalf = Rect(0.5f, 0f, 1f, 1f)
+            val curlDragInteraction = PageCurlConfig.StartEndDragInteraction(
+                pointerBehavior = PageCurlConfig.DragInteraction.PointerBehavior.PageEdge,
+                forward = PageCurlConfig.StartEndDragInteraction.Config(
+                    start = if (isLeftToRight) rightHalf else leftHalf,
+                    end = if (isLeftToRight) leftHalf else rightHalf,
+                ),
+                backward = PageCurlConfig.StartEndDragInteraction.Config(
+                    start = if (isLeftToRight) leftHalf else rightHalf,
+                    end = if (isLeftToRight) rightHalf else leftHalf,
+                ),
+            )
+            val pageCurlConfig = rememberPageCurlConfig(
+                backPageColor = Paper,
+                backPageContentAlpha = 0.08f,
+                shadowColor = Color.Black,
+                shadowAlpha = 0.28f,
+                shadowRadius = 18.dp,
+                shadowOffset = DpOffset((-6).dp, 0.dp),
+                dragInteraction = curlDragInteraction,
+                tapForwardEnabled = false,
+                tapBackwardEnabled = false,
+                tapCustomEnabled = false,
+            )
+            val canTurnBackward = if (doublePage) {
+                previousSpreadPage != null && state.previousSpreadImages != null
+            } else {
+                state.pageIndex > 0 && state.previousPageBitmap != null
+            }
+            val canTurnForward = if (doublePage) {
+                nextSpreadPage != null && state.nextSpreadImages != null
+            } else {
+                state.pageIndex + 1 < state.pageCount && state.nextPageBitmap != null
+            }
+            val pageTurnInteractionEnabled = !state.isLoading && !state.selectionMode &&
+                !lensVisible && !controlsVisible
+            SideEffect {
+                pageCurlConfig.dragInteraction = curlDragInteraction
+                pageCurlConfig.dragBackwardEnabled = pageTurnInteractionEnabled && canTurnBackward
+                pageCurlConfig.dragForwardEnabled = pageTurnInteractionEnabled && canTurnForward
+                pageCurlConfig.tapBackwardEnabled = false
+                pageCurlConfig.tapForwardEnabled = false
+                pageCurlConfig.tapCustomEnabled = false
+            }
+            LaunchedEffect(pageTurnState.current) {
+                val target = when (pageTurnState.current) {
+                    0 -> if (doublePage) previousSpreadPage else (state.pageIndex - 1).takeIf { it >= 0 }
+                    2 -> if (doublePage) nextSpreadPage else (state.pageIndex + 1).takeIf { it < state.pageCount }
+                    else -> null
+                }
+                if (target != null) {
+                    lensVisible = false
+                    controlsVisible = false
+                    onPageChange(target)
+                } else if (pageTurnState.current != 1) {
+                    pageTurnState.snapTo(1)
+                }
+            }
+            LaunchedEffect(state.error) {
+                if (state.error != null && pageTurnState.current != 1) pageTurnState.snapTo(1)
+            }
+            LaunchedEffect(state.pageIndex, spreadMode, previousSpreadPage, nextSpreadPage) {
+                onLoadNeighborSpreads(
+                    previousSpreadPage.takeIf { spreadMode },
+                    nextSpreadPage.takeIf { spreadMode },
+                )
+            }
             if (bitmap != null) {
                 val onTapBackground: (Offset, IntSize) -> Unit = { point, size ->
                     if (point.x in size.width * 0.30f..size.width * 0.70f) {
@@ -454,118 +507,79 @@ private fun ComicReaderScreen(
                         controlsVisible = false
                     }
                 }
-                if (!doublePage) {
-                    PageCanvas(
-                        modifier = Modifier.fillMaxSize(),
-                        bitmap = bitmap,
-                        previousPageBitmap = state.previousPageBitmap,
-                        nextPageBitmap = state.nextPageBitmap,
-                        pageIndex = state.pageIndex,
-                        pageError = state.error,
-                        readingDirection = state.readingDirection,
-                        selectionMode = state.selectionMode,
-                        selected = state.selection,
-                        regions = regions,
-                        activeRegionIndex = activeRegionIndex,
-                        guidedMode = lensVisible && lensPageIndex == state.pageIndex,
-                        onChooseRegion = { index ->
-                            lensPageIndex = state.pageIndex
-                            onChooseRegion(index)
-                            lensVisible = true
-                            controlsVisible = false
-                        },
-                        onRegionSelected = onRegionSelected,
-                        onBackgroundTap = onTapBackground,
-                        onLongPress = { controlsVisible = true; lensVisible = false },
-                        onDismissLens = { lensVisible = false },
-                        onPageTurn = { pageDelta ->
-                            lensVisible = false
-                            controlsVisible = false
-                            onPageChange(state.pageIndex + pageDelta)
-                        },
-                    )
-                } else {
-                    val firstIsOnLeft = state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT
-                    val firstPage = displaySpread.first
-                    val secondPage = displaySpread.second
-                    val pageOrder = if (firstIsOnLeft) listOf(firstPage, secondPage)
-                        else listOf(secondPage, firstPage)
-                    Row(
-                        modifier = Modifier.fillMaxSize()
-                            .graphicsLayer {
-                                rotationY = if (spreadTurnPending >= 0) spreadTurnAngle.value else spreadDragAngle
-                                cameraDistance = 14f * density
-                                shadowElevation = kotlin.math.abs(rotationY) * 0.25f
-                            }
-                            .pointerInput(state.pageIndex, state.pageCount, state.separateCover) {
-                            var swipeDistance = 0f
-                            detectHorizontalDragGestures(
-                                onDragStart = { swipeDistance = 0f },
-                                onHorizontalDrag = { change, delta ->
-                                    swipeDistance += delta
-                                    spreadDragAngle = (-swipeDistance / size.width.toFloat() * 88f).coerceIn(-78f, 78f)
-                                    change.consume()
-                                },
-                                onDragEnd = {
-                                    var committed = false
-                                    if (kotlin.math.abs(swipeDistance) > size.width * 0.18f) {
-                                        val towardNext = if (firstIsOnLeft) swipeDistance < 0f else swipeDistance > 0f
-                                        val target = if (towardNext) nextSpreadPage else previousSpreadPage
-                                        if (target != null) {
-                                            committed = true
-                                            lensVisible = false
-                                            turnToSpread(target, towardNext)
-                                        }
-                                    }
-                                    if (!committed) {
-                                        spreadTurnScope.launch {
-                                            spreadTurnAngle.snapTo(spreadDragAngle)
-                                            spreadTurnAngle.animateTo(0f, tween(170))
-                                            spreadDragAngle = 0f
-                                        }
-                                    }
-                                },
-                                onDragCancel = {
-                                    spreadTurnScope.launch {
-                                        spreadTurnAngle.snapTo(spreadDragAngle)
-                                        spreadTurnAngle.animateTo(0f, tween(170))
-                                        spreadDragAngle = 0f
-                                    }
-                                },
-                            )
-                        },
-                    ) {
-                        pageOrder.forEachIndexed { pagePosition, pageIndex ->
-                            if (pagePosition == 1) Spacer(Modifier.width(20.dp))
-                            val isCurrent = pageIndex == state.pageIndex
-                            val pageBitmap = if (isCurrent) bitmap else companionBitmap
-                            val pageRegions = if (isCurrent) regions else companionRegions
-                            val pageActiveRegion = if (isCurrent) activeRegionIndex else companionActiveRegion
+                PageCurl(
+                    count = 3,
+                    modifier = Modifier.fillMaxSize(),
+                    state = pageTurnState,
+                    config = pageCurlConfig,
+                ) { turnPage ->
+                    when (turnPage) {
+                        0 -> if (doublePage) {
+                            StaticSpreadPage(state.previousSpreadImages, state.readingDirection)
+                        } else {
+                            StaticComicPage(state.previousPageBitmap)
+                        }
+                        2 -> if (doublePage) {
+                            StaticSpreadPage(state.nextSpreadImages, state.readingDirection)
+                        } else {
+                            StaticComicPage(state.nextPageBitmap)
+                        }
+                        else -> if (!doublePage) {
                             PageCanvas(
-                                modifier = Modifier.weight(1f).fillMaxHeight(),
-                                bitmap = pageBitmap,
-                                previousPageBitmap = if (isCurrent) state.previousPageBitmap else bitmap,
-                                nextPageBitmap = if (isCurrent) state.nextPageBitmap else bitmap,
-                                pageIndex = pageIndex,
-                                pageError = state.error,
-                                readingDirection = state.readingDirection,
-                                selectionMode = false,
-                                selected = null,
-                                regions = pageRegions,
-                                activeRegionIndex = pageActiveRegion,
-                                guidedMode = lensVisible && lensPageIndex == pageIndex,
-                                navigationEnabled = false,
+                                modifier = Modifier.fillMaxSize(),
+                                bitmap = bitmap,
+                                selectionMode = state.selectionMode,
+                                selected = state.selection,
+                                regions = regions,
+                                activeRegionIndex = activeRegionIndex,
+                                guidedMode = lensVisible && lensPageIndex == state.pageIndex,
                                 onChooseRegion = { index ->
-                                    lensPageIndex = pageIndex
-                                    if (isCurrent) onChooseRegion(index) else companionActiveRegion = index
+                                    lensPageIndex = state.pageIndex
+                                    onChooseRegion(index)
                                     lensVisible = true
                                     controlsVisible = false
                                 },
-                                onRegionSelected = {},
+                                onRegionSelected = onRegionSelected,
                                 onBackgroundTap = onTapBackground,
                                 onLongPress = { controlsVisible = true; lensVisible = false },
                                 onDismissLens = { lensVisible = false },
                             )
+                        } else {
+                            val spread = displaySpread
+                            val companion = companionBitmap
+                            val pageOrder = if (isLeftToRight) {
+                                listOf(spread.first, spread.second)
+                            } else {
+                                listOf(spread.second, spread.first)
+                            }
+                            Row(Modifier.fillMaxSize()) {
+                                pageOrder.forEachIndexed { pagePosition, pageIndex ->
+                                    if (pagePosition == 1) Spacer(Modifier.width(20.dp))
+                                    val isCurrent = pageIndex == state.pageIndex
+                                    val pageBitmap = if (isCurrent) bitmap else companion
+                                    val pageRegions = if (isCurrent) regions else companionRegions
+                                    val pageActiveRegion = if (isCurrent) activeRegionIndex else companionActiveRegion
+                                    PageCanvas(
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                        bitmap = pageBitmap,
+                                        selectionMode = false,
+                                        selected = null,
+                                        regions = pageRegions,
+                                        activeRegionIndex = pageActiveRegion,
+                                        guidedMode = lensVisible && lensPageIndex == pageIndex,
+                                        onChooseRegion = { index ->
+                                            lensPageIndex = pageIndex
+                                            if (isCurrent) onChooseRegion(index) else companionActiveRegion = index
+                                            lensVisible = true
+                                            controlsVisible = false
+                                        },
+                                        onRegionSelected = {},
+                                        onBackgroundTap = onTapBackground,
+                                        onLongPress = { controlsVisible = true; lensVisible = false },
+                                        onDismissLens = { lensVisible = false },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -682,13 +696,12 @@ private fun ComicReaderScreen(
             ) {
                 OutlinedButton(
                     onClick = {
-                        val target = if (spreadMode) previousSpreadPage else state.pageIndex - 1
-                        if (target != null) {
-                            if (spreadMode) turnToSpread(target, false) else onPageChange(target)
+                        if (canTurnBackward) {
                             lensVisible = false
+                            pageTurnScope.launch { pageTurnState.prev() }
                         }
                     },
-                    enabled = !state.isLoading && if (spreadMode) previousSpreadPage != null else state.pageIndex > 0,
+                    enabled = !state.isLoading && pageTurnState.progress == 0f && canTurnBackward,
                 ) { Text("‹") }
 
                 Text(
@@ -718,13 +731,12 @@ private fun ComicReaderScreen(
                 } else {
                     OutlinedButton(
                         onClick = {
-                            val target = if (spreadMode) nextSpreadPage else state.pageIndex + 1
-                            if (target != null) {
-                                if (spreadMode) turnToSpread(target, true) else onPageChange(target)
+                            if (canTurnForward) {
                                 lensVisible = false
+                                pageTurnScope.launch { pageTurnState.next() }
                             }
                         },
-                        enabled = !state.isLoading && if (spreadMode) nextSpreadPage != null else state.pageIndex + 1 < state.pageCount,
+                        enabled = !state.isLoading && pageTurnState.progress == 0f && canTurnForward,
                     ) { Text("›") }
                 }
             }
@@ -847,45 +859,58 @@ private fun ComicReaderScreen(
 }
 
 @Composable
+private fun StaticComicPage(bitmap: Bitmap?, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxSize().background(Color(0xFF181816)), contentAlignment = Alignment.Center) {
+        if (bitmap != null && !bitmap.isRecycled) {
+            val image = remember(bitmap) { bitmap.asImageBitmap() }
+            Image(
+                bitmap = image,
+                contentDescription = "Página do quadrinho",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+            )
+        }
+    }
+}
+
+@Composable
+private fun StaticSpreadPage(images: ReaderSpreadImages?, direction: com.estante.reader.core.guided.ReadingDirection) {
+    val secondBitmap = images?.secondBitmap
+    if (images == null || images.spread.second == null || secondBitmap == null) {
+        StaticComicPage(images?.firstBitmap)
+        return
+    }
+    val ordered = if (direction == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
+        listOf(images.firstBitmap, secondBitmap)
+    } else {
+        listOf(secondBitmap, images.firstBitmap)
+    }
+    Row(Modifier.fillMaxSize()) {
+        ordered.forEachIndexed { index, page ->
+            if (index == 1) Spacer(Modifier.width(20.dp))
+            StaticComicPage(page, Modifier.weight(1f).fillMaxHeight())
+        }
+    }
+}
+
+@Composable
 private fun PageCanvas(
     modifier: Modifier = Modifier,
     bitmap: Bitmap,
-    previousPageBitmap: Bitmap?,
-    nextPageBitmap: Bitmap?,
-    pageIndex: Int,
-    pageError: String?,
-    readingDirection: com.estante.reader.core.guided.ReadingDirection,
     selectionMode: Boolean,
     selected: NormalizedRect?,
     regions: List<GuidedRegion>,
     activeRegionIndex: Int,
     guidedMode: Boolean,
-    navigationEnabled: Boolean = true,
     onChooseRegion: (Int) -> Unit,
     onRegionSelected: (NormalizedRect) -> Unit,
     onBackgroundTap: (Offset, IntSize) -> Unit = { _, _ -> },
     onLongPress: () -> Unit = {},
     onDismissLens: () -> Unit = {},
-    onPageTurn: (Int) -> Unit = {},
 ) {
     var dragStart by remember(bitmap) { mutableStateOf<Offset?>(null) }
     var dragPreview by remember(bitmap) { mutableStateOf<NormalizedRect?>(null) }
-    var dragDistance by remember(bitmap) { mutableFloatStateOf(0f) }
-    var turnTarget by remember(bitmap) { mutableStateOf<Bitmap?>(null) }
-    var turnPageDelta by remember(bitmap) { mutableIntStateOf(0) }
-    var settling by remember(bitmap) { mutableStateOf(false) }
-    val settleOffset = remember(bitmap) { Animatable(0f) }
-    val gestureScope = rememberCoroutineScope()
     val bitmapImage: ImageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
-    val turnTargetImage: ImageBitmap? = remember(turnTarget) { turnTarget?.asImageBitmap() }
-
-    LaunchedEffect(bitmap, pageIndex, pageError) {
-        dragDistance = 0f
-        turnTarget = null
-        settling = false
-        settleOffset.snapTo(0f)
-    }
-
     val activeBounds = regions.getOrNull(activeRegionIndex)?.bounds ?: selected
     BoxWithConstraints(
         modifier = modifier
@@ -894,96 +919,17 @@ private fun PageCanvas(
                 detectTapGestures(
                     onLongPress = { onLongPress() },
                     onTap = { point ->
-                    val normalized = toNormalized(point, size, bitmap.width, bitmap.height)
-                    if (normalized == null) {
-                        onBackgroundTap(point, IntSize(size.width, size.height))
-                        return@detectTapGestures
-                    }
-                    val hit = regions.indices.reversed().firstOrNull { index ->
-                        val rect = regions[index].bounds
-                        normalized.first in rect.left..rect.right && normalized.second in rect.top..rect.bottom
-                    }
-                    if (hit != null) onChooseRegion(hit)
-                    else onBackgroundTap(point, IntSize(size.width, size.height))
-                }
-                )
-            }
-            .pointerInput(bitmap, selectionMode, previousPageBitmap, nextPageBitmap, readingDirection, navigationEnabled) {
-                if (selectionMode || !navigationEnabled) return@pointerInput
-                var horizontalDistance = 0f
-                val velocityTracker = VelocityTracker()
-                detectHorizontalDragGestures(
-                    onDragStart = {
-                        horizontalDistance = 0f
-                        velocityTracker.resetTracking()
-                        dragDistance = 0f
-                        turnTarget = null
-                        turnPageDelta = 0
-                        settling = false
-                    },
-                    onHorizontalDrag = { change, amount ->
-                        horizontalDistance += amount
-                        velocityTracker.addPosition(change.uptimeMillis, change.position)
-                        change.consume()
-                        if (turnTarget == null && kotlin.math.abs(horizontalDistance) > 14.dp.toPx()) {
-                            val movingLeft = horizontalDistance < 0f
-                            val forward = (readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT && movingLeft) ||
-                                (readingDirection == com.estante.reader.core.guided.ReadingDirection.RIGHT_TO_LEFT && !movingLeft)
-                            val target = if (forward) nextPageBitmap else previousPageBitmap
-                            if (target != null) {
-                                turnTarget = target
-                                turnPageDelta = if (forward) 1 else -1
-                            }
+                        val normalized = toNormalized(point, size, bitmap.width, bitmap.height)
+                        if (normalized == null) {
+                            onBackgroundTap(point, IntSize(size.width, size.height))
+                            return@detectTapGestures
                         }
-                        if (turnTarget != null) {
-                            val imageWidth = fittedImageRect(
-                                Size(size.width.toFloat(), size.height.toFloat()), bitmap.width, bitmap.height,
-                            ).width
-                            dragDistance = horizontalDistance.coerceIn(-imageWidth, imageWidth)
+                        val hit = regions.indices.reversed().firstOrNull { index ->
+                            val rect = regions[index].bounds
+                            normalized.first in rect.left..rect.right && normalized.second in rect.top..rect.bottom
                         }
-                    },
-                    onDragEnd = {
-                        val target = turnTarget
-                        val distance = dragDistance
-                        val imageWidth = fittedImageRect(
-                            Size(size.width.toFloat(), size.height.toFloat()), bitmap.width, bitmap.height,
-                        ).width
-                        val velocityX = velocityTracker.calculateVelocity().x
-                        val distanceCommit = kotlin.math.abs(distance) >= imageWidth * 0.32f
-                        val flingCommit = kotlin.math.abs(distance) >= imageWidth * 0.10f &&
-                            kotlin.math.abs(velocityX) >= 1000.dp.toPx() &&
-                            kotlin.math.sign(velocityX) == kotlin.math.sign(distance)
-                        val commit = target != null && (distanceCommit || flingCommit)
-                        if (target != null && distance != 0f) {
-                            settling = true
-                            gestureScope.launch {
-                                settleOffset.snapTo(distance)
-                                settleOffset.animateTo(
-                                    targetValue = if (commit) kotlin.math.sign(distance) * imageWidth else 0f,
-                                    animationSpec = tween(durationMillis = if (commit) 260 else 190),
-                                )
-                                if (commit) {
-                                    onPageTurn(turnPageDelta)
-                                } else {
-                                    turnTarget = null
-                                    dragDistance = 0f
-                                    settling = false
-                                }
-                            }
-                        } else {
-                            turnTarget = null
-                            dragDistance = 0f
-                        }
-                    },
-                    onDragCancel = {
-                        gestureScope.launch {
-                            settling = true
-                            settleOffset.snapTo(dragDistance)
-                            settleOffset.animateTo(0f, tween(160))
-                            turnTarget = null
-                            dragDistance = 0f
-                            settling = false
-                        }
+                        if (hit != null) onChooseRegion(hit)
+                        else onBackgroundTap(point, IntSize(size.width, size.height))
                     },
                 )
             }
@@ -1026,68 +972,7 @@ private fun PageCanvas(
             modifier = Modifier.fillMaxSize(),
             contentScale = ContentScale.Fit,
         )
-        if (turnTarget != null) {
-            Canvas(Modifier.fillMaxSize()) {
-                val fit = fittedImageRect(size, bitmap.width, bitmap.height)
-                val offsetX = if (settling) settleOffset.value else dragDistance
-                val width = fit.width
-                val edge = if (offsetX < 0f) (fit.left + width + offsetX).coerceIn(fit.left, fit.left + width)
-                    else (fit.left + offsetX).coerceIn(fit.left, fit.left + width)
-                val imageOffset = IntOffset(fit.left.roundToInt(), fit.top.roundToInt())
-                val imageSize = IntSize(fit.width.roundToInt().coerceAtLeast(1), fit.height.roundToInt().coerceAtLeast(1))
-                drawImage(
-                    turnTargetImage ?: return@Canvas,
-                    dstOffset = imageOffset,
-                    dstSize = imageSize,
-                )
-                if (offsetX < 0f) {
-                    clipRect(fit.left, fit.top, edge, fit.top + fit.height) {
-                        drawImage(bitmapImage, dstOffset = imageOffset, dstSize = imageSize)
-                    }
-                } else {
-                    clipRect(edge, fit.top, fit.left + fit.width, fit.top + fit.height) {
-                        drawImage(bitmapImage, dstOffset = imageOffset, dstSize = imageSize)
-                    }
-                }
-                val depth = (fit.width * 0.085f).coerceAtLeast(24.dp.toPx())
-                val stripLeft = if (offsetX < 0f) edge else (edge - depth).coerceAtLeast(fit.left)
-                val stripRight = if (offsetX < 0f) (edge + depth).coerceAtMost(fit.left + fit.width) else edge
-                if (stripRight > stripLeft) {
-                    val foldPath = Path().apply {
-                        moveTo(edge, fit.top)
-                        val bend = depth * if (offsetX < 0f) 0.34f else -0.34f
-                        cubicTo(edge + bend, fit.top + fit.height * 0.28f, edge - bend, fit.top + fit.height * 0.72f, edge, fit.top + fit.height)
-                        lineTo(stripRight, fit.top + fit.height)
-                        lineTo(stripLeft, fit.top + fit.height)
-                        lineTo(stripLeft, fit.top)
-                        close()
-                    }
-                    drawPath(foldPath, Color(0xFFF2EEE6))
-                    drawRect(
-                        brush = Brush.horizontalGradient(
-                            colors = listOf(Color(0x00302B26), Color(0x66302B26), Color(0x44302B26), Color(0x00FFFFFF)),
-                            startX = stripLeft,
-                            endX = stripRight.coerceAtLeast(stripLeft + 1f),
-                        ),
-                        topLeft = Offset(stripLeft, fit.top),
-                        size = Size(stripRight - stripLeft, fit.height),
-                    )
-                }
-                val shadowWidth = 20.dp.toPx()
-                val shadowLeft = (edge - shadowWidth).coerceAtLeast(fit.left)
-                val shadowRight = (edge + shadowWidth).coerceAtMost(fit.left + fit.width)
-                drawRect(
-                    brush = Brush.horizontalGradient(
-                        colors = listOf(Color.Transparent, Color(0x66000000), Color.Transparent),
-                        startX = shadowLeft,
-                        endX = shadowRight.coerceAtLeast(shadowLeft + 1f),
-                    ),
-                    topLeft = Offset(shadowLeft, fit.top),
-                    size = Size((shadowRight - shadowLeft).coerceAtLeast(1f), fit.height),
-                )
-            }
-        }
-        if (turnTarget == null) Canvas(Modifier.fillMaxSize()) {
+        Canvas(Modifier.fillMaxSize()) {
             val fit = fittedImageRect(size, bitmap.width, bitmap.height)
             if (guidedMode) {
                 regions.getOrNull(activeRegionIndex)?.bounds?.let { box ->
@@ -1130,7 +1015,7 @@ private fun PageCanvas(
                 fontSize = 13.sp,
             )
         }
-        if (turnTarget == null && guidedMode && activeBounds != null) {
+        if (guidedMode && activeBounds != null) {
             BubbleLensOverlay(
                 modifier = Modifier.align(Alignment.TopStart),
                 bitmap = bitmapImage,

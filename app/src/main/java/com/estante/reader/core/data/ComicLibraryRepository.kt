@@ -110,10 +110,11 @@ class ComicLibraryRepository(private val dao: ComicDao) {
         if (existing != null) {
             return existing
         }
-        val format = if (uri.lastPathSegment.orEmpty().substringAfterLast('.', "").equals("cbr", ignoreCase = true)) {
-            ComicFormat.CBR
-        } else {
-            ComicFormat.CBZ
+        val extension = uri.lastPathSegment.orEmpty().substringAfterLast('.', "")
+        val format = when {
+            extension.equals("cbr", ignoreCase = true) -> ComicFormat.CBR
+            extension.equals("pdf", ignoreCase = true) -> ComicFormat.PDF
+            else -> ComicFormat.CBZ
         }
         val migrated = ComicEntity(
             id = id,

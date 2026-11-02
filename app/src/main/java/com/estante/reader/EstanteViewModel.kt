@@ -11,12 +11,12 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.estante.reader.core.archive.ComicArchive
-import com.estante.reader.core.archive.ComicArchiveFactory
+import com.estante.reader.core.archive.OpenedPageDocument
+import com.estante.reader.core.archive.PageDocument
+import com.estante.reader.core.archive.PageDocumentFactory
 import com.estante.reader.core.analysis.OrtBubbleDetector
 import com.estante.reader.core.data.ComicDatabase
 import com.estante.reader.core.data.ComicEntity
-import com.estante.reader.core.data.ComicFormat
 import com.estante.reader.core.data.ComicImportState
 import com.estante.reader.core.data.ComicLibraryRepository
 import com.estante.reader.core.guided.GuidedRegion
@@ -25,6 +25,8 @@ import com.estante.reader.core.guided.NormalizedRect
 import com.estante.reader.core.guided.PageAnalysisStore
 import com.estante.reader.core.guided.ReadingDirection
 import com.estante.reader.core.reader.PageDisplayMode
+import com.estante.reader.core.reader.ReaderSpread
+import com.estante.reader.core.reader.ReaderSpreadBuilder
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -61,6 +63,12 @@ private val PanoramasAlonePreference = booleanPreferencesKey("panoramas_alone")
 
 private data class MaterializedArchive(val file: File, val fingerprint: String)
 
+data class ReaderSpreadImages(
+    val spread: ReaderSpread,
+    val firstBitmap: Bitmap,
+    val secondBitmap: Bitmap?,
+)
+
 data class ReaderUiState(
     val isLoading: Boolean = false,
     val isImporting: Boolean = false,
@@ -81,6 +89,8 @@ data class ReaderUiState(
     val spreadPageIndex: Int? = null,
     val spreadPageBitmap: Bitmap? = null,
     val spreadPageRegions: List<GuidedRegion> = emptyList(),
+    val previousSpreadImages: ReaderSpreadImages? = null,
+    val nextSpreadImages: ReaderSpreadImages? = null,
     val guidedRegions: List<GuidedRegion> = emptyList(),
     val activeRegionIndex: Int = -1,
     val guidedModeEnabled: Boolean = true,
@@ -106,7 +116,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     val libraryItems: StateFlow<List<LibraryComicUi>> = _libraryItems.asStateFlow()
 
     private var currentComicId: String? = null
-    private var archive: ComicArchive? = null
+    private var pageDocument: PageDocument? = null
     private var sourceUri: Uri? = null
     private var cachedArchiveUri: Uri? = null
     private var cachedArchiveFile: File? = null
@@ -114,6 +124,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     private var documentFingerprint: String? = null
     private var pageJob: Job? = null
     private var adjacentPagesJob: Job? = null
+    private var adjacentSpreadsJob: Job? = null
     private var spreadPageJob: Job? = null
     private var openJob: Job? = null
     private var analysisJob: Job? = null
@@ -193,7 +204,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             var rowCreated = false
             var recordId: String? = null
             var staging: File? = null
-            var preparedArchive: ComicArchive? = null
+            var preparedDocument: OpenedPageDocument? = null
             try {
                 val comicsDir = File(app.filesDir, "library/comics")
                 val stagingDir = File(app.filesDir, "library/imports").apply {
@@ -214,8 +225,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                                 val count = input.read(buffer)
                                 if (count < 0) break
                                 copied += count
-                                if (copied > MAX_ARCHIVE_BYTES) {
-                                    throw IllegalArgumentException("O arquivo compactado excede o limite de 512 MiB.")
+                                if (copied > MAX_DOCUMENT_BYTES) {
+                                    throw IllegalArgumentException("O arquivo excede o limite de 512 MiB.")
                                 }
                                 output.write(buffer, 0, count)
                                 digest.update(buffer, 0, count)
@@ -226,15 +237,16 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     val hash = digest.digest().joinToString("") { "%02x".format(it) }
                     val existing = libraryRepository.findByContentHash(hash)
                     if (existing != null) return@withContext ImportResult(existing, null)
-                    val format = detectArchiveFormat(stage)
-                    val archive = ComicArchiveFactory.openFile(stage, File(app.cacheDir, "cbr-pages/$importId"))
-                    preparedArchive = archive
-                    val pageCount = archive.pageCount
-                    val coverBytes = archive.readPage(0)
+                    val openedDocument = PageDocumentFactory.openFile(stage, File(app.cacheDir, "cbr-pages/$importId"))
+                    preparedDocument = openedDocument
+                    val document = openedDocument.document
+                    val format = openedDocument.format
+                    val pageCount = document.pageCount
+                    val coverBytes = document.readPage(0, maxDimension = 1600, maxPixels = 2_560_000L)
                     if (!comicsDir.exists() && !comicsDir.mkdirs()) {
                         throw IllegalStateException("Não foi possível guardar o quadrinho.")
                     }
-                    val extension = if (format == ComicFormat.CBR) "cbr" else "cbz"
+                    val extension = format.name.lowercase()
                     val target = File(comicsDir, hash + "." + extension)
                     val priorByUri = libraryRepository.findBySourceUri(uri)
                     val id = priorByUri?.takeIf { it.contentHash == null }?.id ?: hash
@@ -272,12 +284,12 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     coverBytes.fill(0)
                     libraryRepository.markReady(id, hash, managed.absolutePath, pageCount, coverPath = coverRelative)
                     val comic = libraryRepository.getById(id) ?: error("O registro da estante desapareceu.")
-                    ImportResult(comic, archive)
+                    ImportResult(comic, openedDocument)
                 }
                 staging?.delete()
-                openComic(imported.comic.id, imported.archive)
+                openComic(imported.comic.id, imported.document)
             } catch (error: Exception) {
-                preparedArchive?.close()
+                preparedDocument?.document?.close()
                 staging?.delete()
                 if (rowCreated) recordId?.let { id -> runCatching { libraryRepository.markFailed(id, friendlyError(error)) } }
                 _state.value = _state.value.copy(isImporting = false, isLoading = false, error = friendlyError(error))
@@ -285,30 +297,35 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private data class ImportResult(val comic: ComicEntity, val archive: ComicArchive?)
+    private data class ImportResult(val comic: ComicEntity, val document: OpenedPageDocument?)
 
     fun openComic(id: String) = openComic(id, null)
 
-    private fun openComic(id: String, preparedArchive: ComicArchive?) {
+    private fun openComic(id: String, preparedDocument: OpenedPageDocument?) {
         openJob?.cancel()
         openJob = viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, error = null)
+            var openedDocument = preparedDocument
             try {
                 val comic = libraryRepository.getById(id) ?: error("Este quadrinho não está na estante.")
                 if (comic.managedPath == null) {
                     val legacyUri = comic.sourceUri?.let(Uri::parse) ?: error("O arquivo precisa ser selecionado novamente.")
-                    preparedArchive?.close()
+                    preparedDocument?.document?.close()
                     importComic(legacyUri)
                     return@launch
                 }
                 val file = File(comic.managedPath)
                 if (!file.isFile) error("O arquivo importado não foi encontrado; importe-o novamente.")
-                val indexed = preparedArchive ?: withContext(Dispatchers.IO) {
-                    ComicArchiveFactory.openFile(file, File(getApplication<Application>().cacheDir, "cbr-pages/$id"))
+                if (openedDocument == null) {
+                    openedDocument = withContext(Dispatchers.IO) {
+                        PageDocumentFactory.openFile(file, File(getApplication<Application>().cacheDir, "cbr-pages/$id"))
+                    }
                 }
+                val activeDocument = requireNotNull(openedDocument)
+                val indexed = activeDocument.document
                 val fingerprint = comic.contentHash ?: withContext(Dispatchers.IO) { sha256File(file) }
-                archive?.close()
-                archive = indexed
+                pageDocument?.close()
+                pageDocument = indexed
                 currentComicId = comic.id
                 sourceUri = Uri.fromFile(file)
                 documentFingerprint = fingerprint
@@ -358,8 +375,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 loadPage(page)
                 startAnalysis(indexed, Uri.fromFile(file), fingerprint)
             } catch (error: Exception) {
-                if (preparedArchive !== archive) preparedArchive?.close()
-                closeArchive()
+                if (openedDocument?.document !== pageDocument) openedDocument?.document?.close()
+                closePageDocument()
                 currentComicId = null
                 sourceUri = null
                 _state.value = _state.value.copy(isLoading = false, isImporting = false, error = friendlyError(error))
@@ -378,18 +395,6 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             comic.coverPath?.let { File(getApplication<Application>().filesDir, it).delete() }
         }
     }
-
-    private fun detectArchiveFormat(file: File): ComicFormat =
-        file.inputStream().buffered().use { input ->
-            val signature = ByteArray(8)
-            val count = input.read(signature)
-            when {
-                count >= 7 && signature[0] == 'R'.code.toByte() && signature[1] == 'a'.code.toByte() &&
-                    signature[2] == 'r'.code.toByte() -> ComicFormat.CBR
-                count >= 4 && signature[0] == 'P'.code.toByte() && signature[1] == 'K'.code.toByte() -> ComicFormat.CBZ
-                else -> throw IllegalArgumentException("O arquivo não é um quadrinho CBZ ou CBR compatível.")
-            }
-        }
 
     private fun writeCoverThumbnail(bytes: ByteArray, target: File) {
         val parent = target.parentFile ?: error("Caminho de capa inválido.")
@@ -430,9 +435,10 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         openJob?.cancel()
         pageJob?.cancel()
         adjacentPagesJob?.cancel()
+        adjacentSpreadsJob?.cancel()
         spreadPageJob?.cancel()
         analysisJob?.cancel()
-        closeArchive()
+        closePageDocument()
         sourceUri = null
         documentFingerprint = null
         val closingComicId = currentComicId
@@ -520,7 +526,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (current.spreadPageIndex == index && current.spreadPageBitmap != null) return
-        val currentArchive = archive ?: return
+        val currentDocument = pageDocument ?: return
         val currentUri = sourceUri ?: return
         spreadPageJob?.cancel()
         val requestId = pageRequestId
@@ -528,7 +534,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         spreadPageJob = viewModelScope.launch(Dispatchers.IO) {
             var loaded: Bitmap? = null
             try {
-                val bytes = currentArchive.readPage(index)
+                val bytes = currentDocument.readPage(index, maxDimension = 2400, maxPixels = 5_760_000L)
                 loaded = withContext(Dispatchers.Default) {
                     decodePage(bytes, maxDimension = 2400, maxPixels = 5_760_000L)
                 }
@@ -549,6 +555,68 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 }
             } finally {
                 loaded?.takeUnless { it.isRecycled }?.recycle()
+            }
+        }
+    }
+
+    fun loadNeighborSpreads(previousFirstPageIndex: Int?, nextFirstPageIndex: Int?) {
+        val current = _state.value
+        val currentDocument = pageDocument ?: return
+        val currentUri = sourceUri ?: return
+        val previousSpread = previousFirstPageIndex?.let {
+            ReaderSpreadBuilder.forPage(it, current.pageCount, current.separateCover)
+        }
+        val nextSpread = nextFirstPageIndex?.let {
+            ReaderSpreadBuilder.forPage(it, current.pageCount, current.separateCover)
+        }
+        adjacentSpreadsJob?.cancel()
+        val requestId = pageRequestId
+        val pageIndex = current.pageIndex
+        _state.value = current.copy(previousSpreadImages = null, nextSpreadImages = null)
+        adjacentSpreadsJob = viewModelScope.launch(Dispatchers.IO) {
+            var previousImages: ReaderSpreadImages? = null
+            var nextImages: ReaderSpreadImages? = null
+
+            suspend fun readSpread(spread: ReaderSpread): ReaderSpreadImages {
+                suspend fun readPage(index: Int): Bitmap {
+                    val bytes = currentDocument.readPage(index, maxDimension = 1600, maxPixels = 2_560_000L)
+                    return withContext(Dispatchers.Default) {
+                        decodePage(bytes, maxDimension = 1600, maxPixels = 2_560_000L)
+                    }
+                }
+                val first = readPage(spread.first)
+                val second = try {
+                    if (spread.second != null) readPage(spread.second) else null
+                } catch (error: Exception) {
+                    first.recycle()
+                    throw error
+                }
+                return ReaderSpreadImages(spread, first, second)
+            }
+
+            try {
+                previousImages = if (previousSpread != null) readSpread(previousSpread) else null
+                nextImages = if (nextSpread != null) readSpread(nextSpread) else null
+                if (requestId != pageRequestId || sourceUri != currentUri || _state.value.pageIndex != pageIndex) {
+                    return@launch
+                }
+                _state.value = _state.value.copy(
+                    previousSpreadImages = previousImages,
+                    nextSpreadImages = nextImages,
+                )
+                previousImages = null
+                nextImages = null
+            } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+            } finally {
+                previousImages?.let { images ->
+                    images.firstBitmap.recycle()
+                    images.secondBitmap?.recycle()
+                }
+                nextImages?.let { images ->
+                    images.firstBitmap.recycle()
+                    images.secondBitmap?.recycle()
+                }
             }
         }
     }
@@ -578,8 +646,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 it[LastRegionIndex] = preferredRegionIndex
             }
         }
-        archive?.let { currentArchive ->
-            sourceUri?.let { uri -> loadAdjacentPages(current.pageIndex, currentArchive, uri, pageRequestId) }
+        pageDocument?.let { currentDocument ->
+            sourceUri?.let { uri -> loadAdjacentPages(current.pageIndex, currentDocument, uri, pageRequestId) }
         }
     }
 
@@ -625,7 +693,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun startAnalysis(currentArchive: ComicArchive, uri: Uri, fingerprint: String) {
+    private fun startAnalysis(currentDocument: PageDocument, uri: Uri, fingerprint: String) {
         analysisJob?.cancel()
         analysisJob = viewModelScope.launch {
             val detector = try {
@@ -640,12 +708,12 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 return@launch
             }
             try {
-                val firstPage = _state.value.pageIndex.coerceIn(0, currentArchive.pageCount - 1)
+                val firstPage = _state.value.pageIndex.coerceIn(0, currentDocument.pageCount - 1)
                 val pageOrder = buildList {
                     add(firstPage)
-                    if (firstPage + 1 < currentArchive.pageCount) add(firstPage + 1)
-                    if (firstPage + 2 < currentArchive.pageCount) add(firstPage + 2)
-                    addAll((0 until currentArchive.pageCount).filterNot { it in this })
+                    if (firstPage + 1 < currentDocument.pageCount) add(firstPage + 1)
+                    if (firstPage + 2 < currentDocument.pageCount) add(firstPage + 2)
+                    addAll((0 until currentDocument.pageCount).filterNot { it in this })
                 }
                 for (pageIndex in pageOrder) {
                     currentCoroutineContext().ensureActive()
@@ -657,7 +725,9 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                         if (_state.value.pageIndex == pageIndex) {
                             _state.value = _state.value.copy(isAnalyzingCurrentPage = true, analysisError = null)
                         }
-                        val bytes = withContext(Dispatchers.IO) { currentArchive.readPage(pageIndex) }
+                        val bytes = withContext(Dispatchers.IO) {
+                            currentDocument.readPage(pageIndex, maxDimension = 1600, maxPixels = 2_560_000L)
+                        }
                         val analysisBitmap = withContext(Dispatchers.Default) { decodeAnalysisPage(bytes) }
                         try {
                             val pageDetections = withContext(Dispatchers.Default) { detector.detect(analysisBitmap) }
@@ -674,7 +744,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     val count = if (cached == null) oldState.analyzedPages + 1 else oldState.analyzedPages
                     _state.value = oldState.copy(
                         analyzedPages = count,
-                        isAnalyzing = count < currentArchive.pageCount,
+                        isAnalyzing = count < currentDocument.pageCount,
                         isAnalyzingCurrentPage = false,
                         guidedRegions = if (oldState.pageIndex == pageIndex) regions else oldState.guidedRegions,
                         previousPageRegions = if (oldState.pageIndex == pageIndex + 1) regions else oldState.previousPageRegions,
@@ -783,10 +853,11 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun loadPage(index: Int) {
-        val currentArchive = archive ?: return
+        val currentDocument = pageDocument ?: return
         val currentUri = sourceUri ?: return
         pageJob?.cancel()
         adjacentPagesJob?.cancel()
+        adjacentSpreadsJob?.cancel()
         spreadPageJob?.cancel()
         val requestId = ++pageRequestId
         pageJob = viewModelScope.launch {
@@ -795,13 +866,6 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 selectionMode = false,
                 selection = null,
                 guidedRegions = emptyList(),
-                previousPageBitmap = null,
-                nextPageBitmap = null,
-                previousPageRegions = emptyList(),
-                nextPageRegions = emptyList(),
-                spreadPageIndex = null,
-                spreadPageBitmap = null,
-                spreadPageRegions = emptyList(),
                 activeRegionIndex = -1,
                 isAnalyzingCurrentPage = false,
                 guidedBitmap = null,
@@ -813,7 +877,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             recognitionRequestId++
             try {
                 val bitmap = withContext(Dispatchers.IO) {
-                    val bytes = currentArchive.readPage(index)
+                    val bytes = currentDocument.readPage(index)
                     decodePage(bytes)
                 }
                 val fingerprint = documentFingerprint
@@ -837,6 +901,15 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     pageIndex = index,
                     lastReadPage = index,
                     bitmap = bitmap,
+                    previousPageBitmap = null,
+                    nextPageBitmap = null,
+                    previousPageRegions = emptyList(),
+                    nextPageRegions = emptyList(),
+                    spreadPageIndex = null,
+                    spreadPageBitmap = null,
+                    spreadPageRegions = emptyList(),
+                    previousSpreadImages = null,
+                    nextSpreadImages = null,
                     guidedRegions = regions.orEmpty(),
                     activeRegionIndex = when {
                         regions.isNullOrEmpty() -> -1
@@ -855,7 +928,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                         loadedState.guidedRegions.getOrNull(loadedState.activeRegionIndex)?.id,
                     )
                 }
-                loadAdjacentPages(index, currentArchive, currentUri, requestId)
+                loadAdjacentPages(index, currentDocument, currentUri, requestId)
                 if (regions != null) {
                     preferredRegionIndex = _state.value.activeRegionIndex.coerceAtLeast(0)
                     focusLastRegionOnPageLoad = false
@@ -870,14 +943,14 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun loadAdjacentPages(pageIndex: Int, currentArchive: ComicArchive, uri: Uri, requestId: Long) {
+    private fun loadAdjacentPages(pageIndex: Int, currentDocument: PageDocument, uri: Uri, requestId: Long) {
         adjacentPagesJob?.cancel()
         adjacentPagesJob = viewModelScope.launch(Dispatchers.IO) {
             var previous: Bitmap? = null
             var next: Bitmap? = null
             suspend fun decodeNeighbor(index: Int): Bitmap? {
-                if (index !in 0 until currentArchive.pageCount) return null
-                val bytes = currentArchive.readPage(index)
+                if (index !in 0 until currentDocument.pageCount) return null
+                val bytes = currentDocument.readPage(index, maxDimension = 1600, maxPixels = 2_560_000L)
                 return withContext(Dispatchers.Default) {
                     decodePage(bytes, maxDimension = 1600, maxPixels = 2_560_000L)
                 }
@@ -891,7 +964,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     analysisStore.read(fingerprint, OrtBubbleDetector.VERSION, pageIndex - 1)
                         ?.let { GuidedPage(it).orderedRegions(_state.value.readingDirection) }.orEmpty()
                 } else emptyList()
-                val nextRegions = if (fingerprint != null && pageIndex + 1 < currentArchive.pageCount) {
+                val nextRegions = if (fingerprint != null && pageIndex + 1 < currentDocument.pageCount) {
                     analysisStore.read(fingerprint, OrtBubbleDetector.VERSION, pageIndex + 1)
                         ?.let { GuidedPage(it).orderedRegions(_state.value.readingDirection) }.orEmpty()
                 } else emptyList()
@@ -922,9 +995,9 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         return name ?: uri.lastPathSegment?.substringAfterLast('/') ?: "Quadrinho"
     }
 
-    private fun closeArchive() {
-        val current = archive
-        archive = null
+    private fun closePageDocument() {
+        val current = pageDocument
+        pageDocument = null
         runCatching { current?.close() }
     }
 
@@ -955,8 +1028,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                         val count = source.read(buffer)
                         if (count < 0) break
                         copied += count
-                        if (copied > MAX_ARCHIVE_BYTES) {
-                            throw IllegalArgumentException("O arquivo compactado excede o limite de 512 MiB.")
+                        if (copied > MAX_DOCUMENT_BYTES) {
+                            throw IllegalArgumentException("O arquivo excede o limite de 512 MiB.")
                         }
                         output.write(buffer, 0, count)
                         contentDigest.update(buffer, 0, count)
@@ -1039,6 +1112,6 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
 
     private companion object {
-        const val MAX_ARCHIVE_BYTES = 512L * 1024 * 1024
+        const val MAX_DOCUMENT_BYTES = 512L * 1024 * 1024
     }
 }

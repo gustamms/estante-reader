@@ -4,7 +4,7 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
-enum class ComicFormat { CBZ, CBR }
+enum class ComicFormat { CBZ, CBR, PDF }
 enum class ComicImportState { IMPORTING, READY, FAILED }
 
 /** Durable metadata for one locally managed or SAF-linked comic. */

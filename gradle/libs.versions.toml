@@ -11,6 +11,7 @@ onnxRuntime = "1.31.1"
 room = "2.8.5"
 ksp = "2.3.12"
 junrar = "8.1.2"
+pageCurl = "1.5.1"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
@@ -27,6 +28,7 @@ onnxruntime-android = { module = "com.microsoft.onnxruntime:onnxruntime-android"
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 androidx-room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
 junrar = { module = "com.github.junrar:junrar", version.ref = "junrar" }
+pagecurl = { module = "io.github.oleksandrbalan:pagecurl", version.ref = "pageCurl" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
