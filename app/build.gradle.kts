@@ -12,8 +12,8 @@ android {
         applicationId = "com.estante.reader"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.1.0-alpha.3"
+        versionCode = 4
+        versionName = "0.1.0-alpha.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -58,6 +58,7 @@ dependencies {
     ksp(libs.androidx.room.compiler)
     implementation(libs.junrar)
     implementation(libs.pagecurl)
+    implementation(libs.jsoup)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)

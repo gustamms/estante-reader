@@ -126,6 +126,7 @@ private val Muted = Color(0xFF817D73)
 data class LibraryComicUi(
     val id: String,
     val title: String,
+    val formatId: String,
     val coverPath: String?,
     val pageIndex: Int,
     val pageCount: Int,
@@ -165,7 +166,46 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
     BackHandler(enabled = showSettings) { showSettings = false }
 
     if (state.title != null && state.pageCount > 0) {
-        ComicReaderScreen(
+        if (state.publicationRootPath != null) {
+            BookReaderScreen(
+                title = state.title.orEmpty(),
+                author = state.publicationAuthor,
+                bookId = state.publicationId.orEmpty(),
+                rootPath = state.publicationRootPath.orEmpty(),
+                chapters = state.publicationChapters,
+                chapterIndex = state.pageIndex,
+                progression = state.bookProgress,
+                fontSizeSp = state.bookFontSizeSp,
+                lineSpacing = state.bookLineSpacing,
+                marginsDp = state.bookMarginsDp,
+                columnMode = state.bookColumnMode,
+                background = ReaderCanvasBackground.fromId(state.readerCanvasBackgroundId),
+                capabilities = state.publicationCapabilities,
+                bookmarks = state.publicationBookmarks,
+                highlights = state.publicationHighlights,
+                highlightColorId = state.bookHighlightColorId,
+                pendingHighlight = state.pendingBookHighlight,
+                searchResults = state.publicationSearchResults,
+                isSearching = state.isSearchingPublication,
+                onClose = viewModel::closeDocument,
+                onProgress = viewModel::recordBookProgress,
+                onFontSizeChange = viewModel::setBookFontSize,
+                onLineSpacingChange = viewModel::setBookLineSpacing,
+                onMarginsChange = viewModel::setBookMargins,
+                onColumnsChange = viewModel::setBookColumnMode,
+                onBackgroundChange = viewModel::setReaderCanvasBackground,
+                onAddBookmark = viewModel::addBookBookmark,
+                onTextSelection = viewModel::addBookHighlight,
+                onHighlightColorChange = viewModel::setBookHighlightColor,
+                onHighlightItemColorChange = viewModel::changeBookHighlightColor,
+                onOpenHighlight = viewModel::openBookHighlight,
+                onRemoveHighlight = viewModel::removeBookHighlight,
+                onRestoreHighlight = viewModel::restoreBookHighlight,
+                onPendingHighlightConsumed = viewModel::clearPendingBookHighlight,
+                onSearch = viewModel::searchPublication,
+                onOpenSearchResult = { result -> viewModel.recordBookProgress(result.chapterIndex, result.progression) },
+            )
+        } else ComicReaderScreen(
             state = state,
             onClose = viewModel::closeDocument,
             onPageChange = viewModel::goToPage,
@@ -180,7 +220,7 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             isAnalysisRunning = state.isAnalyzing,
             analyzedPageCount = state.analyzedPages,
             totalAnalysisPageCount = state.analysisPageCount,
-            onToggleGuided = { viewModel.setGuidedModeEnabled(!state.guidedModeEnabled) },
+            onSetGuidedMode = viewModel::setGuidedModeEnabled,
             onPreviousRegion = viewModel::previousRegion,
             onNextRegion = viewModel::nextRegion,
             onChooseRegion = viewModel::focusRegion,
@@ -196,6 +236,7 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             onSetPageDisplayMode = viewModel::setPageDisplayMode,
             onSetSeparateCover = viewModel::setSeparateCover,
             onSetPanoramasAlone = viewModel::setPanoramasAlone,
+            onSetReaderCanvasBackground = viewModel::setReaderCanvasBackground,
             onLoadSpreadPage = viewModel::loadSpreadPage,
             onLoadNeighborSpreads = viewModel::loadNeighborSpreads,
         )
@@ -432,7 +473,7 @@ private fun EmptyLibrary(style: LibraryStyle, onImport: () -> Unit, modifier: Mo
             Spacer(Modifier.height(10.dp))
             Text("Sua estante está esperando", color = style.ink, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
             Spacer(Modifier.height(6.dp))
-            Text("Adicione livros ou quadrinhos em PDF, CBZ ou CBR para começar.", color = style.muted, textAlign = TextAlign.Center)
+            Text("Adicione livros EPUB ou MOBI, ou quadrinhos em PDF, CBZ ou CBR para começar.", color = style.muted, textAlign = TextAlign.Center)
             Spacer(Modifier.height(18.dp))
             Button(onClick = onImport, colors = ButtonDefaults.buttonColors(containerColor = style.accent)) { Text("Adicionar à estante") }
         }
@@ -463,7 +504,8 @@ private fun ContinueReadingCard(comic: LibraryComicUi, style: LibraryStyle, onCl
                 Spacer(Modifier.height(5.dp))
                 Text(comic.title, color = style.ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
                 Spacer(Modifier.height(5.dp))
-                Text(if (comic.pageCount > 0) "Página ${(comic.pageIndex + 1).coerceAtMost(comic.pageCount)} de ${comic.pageCount}" else "Abrir leitura", color = style.muted, fontSize = 12.sp)
+                val positionName = if (comic.formatId == "EPUB" || comic.formatId == "MOBI") "Capítulo" else "Página"
+                Text(if (comic.pageCount > 0) "$positionName ${(comic.pageIndex + 1).coerceAtMost(comic.pageCount)} de ${comic.pageCount}" else "Abrir leitura", color = style.muted, fontSize = 12.sp)
                 Spacer(Modifier.height(9.dp))
                 Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(4.dp)).background(style.shelf.copy(alpha = 0.35f))) {
                     Box(Modifier.fillMaxWidth(progress.coerceIn(0.03f, 1f)).fillMaxHeight().background(style.accent))
@@ -714,7 +756,7 @@ private fun ComicReaderScreen(
     isAnalysisRunning: Boolean = false,
     analyzedPageCount: Int = 0,
     totalAnalysisPageCount: Int = 0,
-    onToggleGuided: () -> Unit = {},
+    onSetGuidedMode: (Boolean) -> Unit = {},
     onPreviousRegion: () -> Unit = {},
     onNextRegion: () -> Unit = {},
     onChooseRegion: (Int) -> Unit = {},
@@ -722,6 +764,7 @@ private fun ComicReaderScreen(
     onSetPageDisplayMode: (PageDisplayMode) -> Unit = {},
     onSetSeparateCover: (Boolean) -> Unit = {},
     onSetPanoramasAlone: (Boolean) -> Unit = {},
+    onSetReaderCanvasBackground: (ReaderCanvasBackground) -> Unit = {},
     onLoadSpreadPage: (Int?) -> Unit = {},
     onLoadNeighborSpreads: (Int?, Int?) -> Unit = { _, _ -> },
 ) {
@@ -747,7 +790,8 @@ private fun ComicReaderScreen(
         controller?.hide(WindowInsetsCompat.Type.systemBars())
         onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
     }
-    Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF181816)) {
+    val readerBackground = ReaderCanvasBackground.fromId(state.readerCanvasBackgroundId)
+    Surface(modifier = Modifier.fillMaxSize(), color = readerBackground.color) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val requestedDoublePage = when (state.pageDisplayMode) {
                 PageDisplayMode.SINGLE_PAGE -> false
@@ -800,7 +844,7 @@ private fun ComicReaderScreen(
                 ),
             )
             val pageCurlConfig = rememberPageCurlConfig(
-                backPageColor = Paper,
+                backPageColor = readerBackground.color,
                 backPageContentAlpha = 0.08f,
                 shadowColor = Color.Black,
                 shadowAlpha = 0.28f,
@@ -872,14 +916,14 @@ private fun ComicReaderScreen(
                 ) { turnPage ->
                     when (turnPage) {
                         0 -> if (doublePage) {
-                            StaticSpreadPage(state.previousSpreadImages, state.readingDirection)
+                            StaticSpreadPage(state.previousSpreadImages, state.readingDirection, readerBackground.color)
                         } else {
-                            StaticComicPage(state.previousPageBitmap)
+                            StaticComicPage(state.previousPageBitmap, backgroundColor = readerBackground.color)
                         }
                         2 -> if (doublePage) {
-                            StaticSpreadPage(state.nextSpreadImages, state.readingDirection)
+                            StaticSpreadPage(state.nextSpreadImages, state.readingDirection, readerBackground.color)
                         } else {
-                            StaticComicPage(state.nextPageBitmap)
+                            StaticComicPage(state.nextPageBitmap, backgroundColor = readerBackground.color)
                         }
                         else -> if (!doublePage) {
                             PageCanvas(
@@ -944,293 +988,65 @@ private fun ComicReaderScreen(
             if (state.isLoading && bitmap == null) {
                 CircularProgressIndicator(Modifier.align(Alignment.Center), color = Color(0xFFE4AA8D))
             }
-            if (controlsVisible) Column(
-                modifier = Modifier.fillMaxSize().safeDrawingPadding(),
-            ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color(0xCC181816))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedButton(onClick = onClose, shape = RoundedCornerShape(14.dp)) {
-                    Text("Estante")
-                }
-                Text(
-                    text = state.title.orEmpty(),
-                    color = Color.White,
-                    modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                    maxLines = 1,
-                    fontSize = 14.sp,
-                )
-                Text(
-                    text = if (spreadMode) {
-                        "${displaySpread.first + 1}–${displaySpread.second + 1} / ${state.pageCount}"
-                    } else "${state.pageIndex + 1} / ${state.pageCount}",
-                    color = Color(0xFFD8D3CA),
-                    fontSize = 13.sp,
-                )
-                OutlinedButton(
-                    onClick = onToggleDirection,
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
-                    modifier = Modifier.padding(start = 6.dp).semantics {
-                        contentDescription = if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
-                            "Direção da leitura: esquerda para direita. Toque para alternar."
-                        } else {
-                            "Direção da leitura: direita para esquerda. Toque para alternar."
-                        }
-                    },
-                ) {
-                    Text(
-                        text = if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
-                            "Esquerda → direita"
-                        } else {
-                            "Direita → esquerda"
-                        },
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().background(Color(0xCC181816)).padding(horizontal = 16.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text("Páginas", color = Color(0xFFD8D3CA), fontSize = 13.sp)
-                OutlinedButton(
-                    onClick = {
-                        val nextMode = when (state.pageDisplayMode) {
-                            PageDisplayMode.SINGLE_PAGE -> PageDisplayMode.DOUBLE_PAGE
-                            PageDisplayMode.DOUBLE_PAGE -> PageDisplayMode.AUTOMATIC
-                            PageDisplayMode.AUTOMATIC -> PageDisplayMode.SINGLE_PAGE
-                        }
-                        onSetPageDisplayMode(nextMode)
-                    },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                ) {
-                    Text(
-                        when (state.pageDisplayMode) {
-                            PageDisplayMode.SINGLE_PAGE -> "Uma"
-                            PageDisplayMode.DOUBLE_PAGE -> "Duas"
-                            PageDisplayMode.AUTOMATIC -> "Automático"
-                        },
-                        fontSize = 12.sp,
-                    )
-                }
-                if (state.pageDisplayMode != PageDisplayMode.SINGLE_PAGE) {
-                    Text("Capa sozinha", color = Color(0xFFD8D3CA), fontSize = 12.sp)
-                    Switch(checked = state.separateCover, onCheckedChange = onSetSeparateCover)
-                }
-            }
-            if (state.pageDisplayMode != PageDisplayMode.SINGLE_PAGE) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().background(Color(0xCC181816)).padding(horizontal = 16.dp, vertical = 2.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text("Páginas panorâmicas sozinhas", color = Color(0xFFD8D3CA), fontSize = 12.sp)
-                    Switch(checked = state.panoramasAlone, onCheckedChange = onSetPanoramasAlone)
-                }
-            }
-
-            Spacer(Modifier.weight(1f))
-
-            if (state.isLoading && bitmap != null) {
-                CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally).padding(top = 12.dp), color = Color(0xFFE4AA8D))
-            }
-            if (state.isPreparingZoom) CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally), color = Color(0xFFE4AA8D))
-
-            state.error?.let {
-                Text(
-                    it,
-                    color = Color(0xFFFFB4A4),
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    fontSize = 13.sp,
-                )
-            }
-            state.analysisError?.let {
-                Text(
-                    it,
-                    color = Color(0xFFFFB4A4),
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    fontSize = 13.sp,
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                OutlinedButton(
-                    onClick = {
+            if (controlsVisible) {
+                ReaderControlsOverlay(
+                    state = state,
+                    isGuidedMode = isGuidedMode,
+                    activeRegionIndex = activeRegionIndex,
+                    regionCount = regions.size,
+                    isAnalysisRunning = isAnalysisRunning,
+                    analyzedPageCount = analyzedPageCount,
+                    totalAnalysisPageCount = totalAnalysisPageCount,
+                    canTurnBackward = !state.isLoading && pageTurnState.progress == 0f && canTurnBackward,
+                    canTurnForward = !state.isLoading && pageTurnState.progress == 0f && canTurnForward,
+                    pageLabel = if (spreadMode) {
+                        "Páginas ${displaySpread.first + 1}–${displaySpread.second + 1} de ${state.pageCount}"
+                    } else "Página ${state.pageIndex + 1} de ${state.pageCount}",
+                    onCloseControls = { controlsVisible = false },
+                    onCloseReader = onClose,
+                    onPageChange = onPageChange,
+                    onPreviousPage = {
                         if (canTurnBackward) {
                             lensVisible = false
                             pageTurnScope.launch { pageTurnState.prev() }
                         }
                     },
-                    enabled = !state.isLoading && pageTurnState.progress == 0f && canTurnBackward,
-                ) { Text("‹") }
-
-                Text(
-                    text = when {
-                        state.selectionMode -> "Arraste sobre um balão"
-                        isGuidedMode && regions.isNotEmpty() -> "Balão ${activeRegionIndex.coerceAtLeast(0) + 1} de ${regions.size}"
-                        isAnalysisRunning -> "Preparando balões…"
-                        spreadMode -> "Páginas ${displaySpread.first + 1}–${displaySpread.second + 1}"
-                        else -> "Página ${state.pageIndex + 1}"
+                    onNextPage = {
+                        if (canTurnForward) {
+                            lensVisible = false
+                            pageTurnScope.launch { pageTurnState.next() }
+                        }
                     },
-                    color = Color(0xFFE4DED3),
-                    fontSize = 13.sp,
+                    onSetPageDisplayMode = onSetPageDisplayMode,
+                    onToggleDirection = onToggleDirection,
+                    onSetGuidedMode = onSetGuidedMode,
+                    onPreviousRegion = onPreviousRegion,
+                    onNextRegion = onNextRegion,
+                    onSetSeparateCover = onSetSeparateCover,
+                    onSetPanoramasAlone = onSetPanoramasAlone,
+                    onSetCanvasBackground = onSetReaderCanvasBackground,
+                    onSelectRegion = { enabled ->
+                        onSelectRegion(enabled)
+                        if (enabled) controlsVisible = false
+                    },
+                    onZoom = onZoom,
+                    onRecognize = onRecognize,
+                    onCancelSelection = { onSelectRegion(false); controlsVisible = false },
+                    onExitZoom = onExitZoom,
+                    onCopyText = { text -> clipboard?.setPrimaryClip(ClipData.newPlainText("Texto reconhecido", text)) },
                 )
-
-                if (state.selectionMode) {
-                    Button(
-                        onClick = onRecognize,
-                        enabled = state.selection != null && !state.isRecognizing,
-                        colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
-                    ) {
-                        if (state.isRecognizing) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        } else {
-                            Text("Ler balão")
-                        }
-                    }
-                } else {
-                    OutlinedButton(
-                        onClick = {
-                            if (canTurnForward) {
-                                lensVisible = false
-                                pageTurnScope.launch { pageTurnState.next() }
-                            }
-                        },
-                        enabled = !state.isLoading && pageTurnState.progress == 0f && canTurnForward,
-                    ) { Text("›") }
-                }
-            }
-
-            if (state.recognizedText != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2B27))
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = state.recognizedText,
-                        color = Color.White,
-                        modifier = Modifier.weight(1f),
-                        fontSize = 14.sp,
-                    )
-                    if (state.guidedBitmap != null) {
-                        OutlinedButton(onClick = onExitZoom) { Text("Voltar") }
-                    }
-                    Button(
-                        onClick = { clipboard?.setPrimaryClip(ClipData.newPlainText("Texto reconhecido", state.recognizedText)) },
-                        colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
-                    ) { Text("Copiar") }
-                }
-            } else if (state.selectionMode && state.selection != null) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2B27))
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedButton(onClick = { onSelectRegion(false) }) { Text("Cancelar") }
-                    Button(
-                        onClick = onZoom,
-                        enabled = !state.isPreparingZoom,
-                        colors = ButtonDefaults.buttonColors(containerColor = Olive),
-                    ) { Text("Ampliar balão") }
-                    Button(
-                        onClick = onRecognize,
-                        enabled = !state.isRecognizing,
-                        colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
-                    ) { Text("Ler texto") }
-                }
-            } else if (isGuidedMode && regions.isNotEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2B27))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    OutlinedButton(
-                        onClick = onPreviousRegion,
-                        enabled = activeRegionIndex > 0 || state.pageIndex > 0,
-                    ) { Text("‹") }
-                    Text(
-                        text = "${activeRegionIndex.coerceAtLeast(0) + 1} / ${regions.size}",
-                        color = Color.White,
-                        modifier = Modifier.align(Alignment.CenterVertically),
-                    )
-                    Button(
-                        onClick = onNextRegion,
-                        colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
-                    ) { Text("Próximo balão ›") }
-                    OutlinedButton(onClick = onToggleGuided) { Text("Página") }
-                }
-            } else if (isAnalysisRunning) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2B27))
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = if (totalAnalysisPageCount > 0) "Preparando balões · $analyzedPageCount/$totalAnalysisPageCount" else "Preparando balões…",
-                        color = Color.White,
-                        fontSize = 13.sp,
-                    )
-                    OutlinedButton(onClick = { onSelectRegion(true) }, enabled = state.bitmap != null) {
-                        Text("Selecionar manualmente")
-                    }
-                }
-            } else {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color(0xFF2C2B27))
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column {
-                        Text(text = "Lupa de balões", color = Color.White, fontWeight = FontWeight.SemiBold)
-                        if (regions.isEmpty() && analyzedPageCount > 0) {
-                            Text("Nenhum balão nesta página", color = Color(0xFFBDB8AD), fontSize = 12.sp)
-                        }
-                    }
-                    if (regions.isNotEmpty()) {
-                        OutlinedButton(onClick = onToggleGuided) { Text("Ler balões") }
-                    }
-                    OutlinedButton(
-                        onClick = { onSelectRegion(!state.selectionMode) },
-                        enabled = state.bitmap != null && !state.isLoading,
-                    ) {
-                        Text(if (state.selectionMode) "Cancelar seleção" else "Selecionar balão")
-                    }
-                }
             }
         }
-    }
     }
 }
 
 @Composable
-private fun StaticComicPage(bitmap: Bitmap?, modifier: Modifier = Modifier) {
-    Box(modifier.fillMaxSize().background(Color(0xFF181816)), contentAlignment = Alignment.Center) {
+private fun StaticComicPage(
+    bitmap: Bitmap?,
+    modifier: Modifier = Modifier,
+    backgroundColor: Color = ReaderCanvasBackground.default.color,
+) {
+    Box(modifier.fillMaxSize().background(backgroundColor), contentAlignment = Alignment.Center) {
         if (bitmap != null && !bitmap.isRecycled) {
             val image = remember(bitmap) { bitmap.asImageBitmap() }
             Image(
@@ -1244,10 +1060,14 @@ private fun StaticComicPage(bitmap: Bitmap?, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun StaticSpreadPage(images: ReaderSpreadImages?, direction: com.estante.reader.core.guided.ReadingDirection) {
+private fun StaticSpreadPage(
+    images: ReaderSpreadImages?,
+    direction: com.estante.reader.core.guided.ReadingDirection,
+    backgroundColor: Color,
+) {
     val secondBitmap = images?.secondBitmap
     if (images == null || images.spread.second == null || secondBitmap == null) {
-        StaticComicPage(images?.firstBitmap)
+        StaticComicPage(images?.firstBitmap, backgroundColor = backgroundColor)
         return
     }
     val ordered = if (direction == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
@@ -1258,7 +1078,7 @@ private fun StaticSpreadPage(images: ReaderSpreadImages?, direction: com.estante
     Row(Modifier.fillMaxSize()) {
         ordered.forEachIndexed { index, page ->
             if (index == 1) Spacer(Modifier.width(20.dp))
-            StaticComicPage(page, Modifier.weight(1f).fillMaxHeight())
+            StaticComicPage(page, Modifier.weight(1f).fillMaxHeight(), backgroundColor)
         }
     }
 }

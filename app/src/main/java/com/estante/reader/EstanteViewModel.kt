@@ -17,8 +17,11 @@ import com.estante.reader.core.archive.PageDocumentFactory
 import com.estante.reader.core.analysis.OrtBubbleDetector
 import com.estante.reader.core.data.ComicDatabase
 import com.estante.reader.core.data.ComicEntity
+import com.estante.reader.core.data.ComicFormat
 import com.estante.reader.core.data.ComicImportState
 import com.estante.reader.core.data.ComicLibraryRepository
+import com.estante.reader.core.data.BookHighlightEntity
+import com.estante.reader.core.data.BookHighlightRepository
 import com.estante.reader.core.guided.GuidedRegion
 import com.estante.reader.core.guided.GuidedPage
 import com.estante.reader.core.guided.NormalizedRect
@@ -27,6 +30,16 @@ import com.estante.reader.core.guided.ReadingDirection
 import com.estante.reader.core.reader.PageDisplayMode
 import com.estante.reader.core.reader.ReaderSpread
 import com.estante.reader.core.reader.ReaderSpreadBuilder
+import com.estante.reader.core.publication.ImportedPublication
+import com.estante.reader.core.publication.PublicationChapter
+import com.estante.reader.core.publication.PublicationBookmark
+import com.estante.reader.core.publication.PublicationSearchResult
+import com.estante.reader.core.publication.BookColumnMode
+import com.estante.reader.core.publication.PublicationImportRegistry
+import com.estante.reader.core.publication.PublicationManifestStore
+import com.estante.reader.core.publication.PublicationCapabilities
+import com.estante.reader.core.publication.BookHighlightColor
+import com.estante.reader.core.publication.PublicationImporter
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -41,6 +54,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
@@ -61,6 +76,18 @@ private val PageDisplayModePreference = stringPreferencesKey("page_display_mode"
 private val SeparateCoverPreference = booleanPreferencesKey("separate_cover")
 private val PanoramasAlonePreference = booleanPreferencesKey("panoramas_alone")
 private val LibraryStylePreference = stringPreferencesKey("library_style")
+private val ReaderCanvasBackgroundPreference = stringPreferencesKey("reader_canvas_background")
+private val GuidedModePreference = booleanPreferencesKey("guided_mode_enabled")
+private val BookLocationPrefix = "book_location_"
+private val BookFontSizePrefix = "book_font_size_"
+private val BookColumnModePrefix = "book_column_mode_"
+private val BookLineSpacingPrefix = "book_line_spacing_"
+private val BookMarginsPrefix = "book_margins_"
+private val BookmarksPrefix = "bookmarks_"
+private val BookHighlightColorPrefix = "book_highlight_color_"
+private const val MIN_HIGHLIGHT_TEXT_LENGTH = 2
+private const val MAX_HIGHLIGHT_TEXT_LENGTH = 5000
+private const val HIGHLIGHT_CONTEXT_LENGTH = 80
 
 private data class MaterializedArchive(val file: File, val fingerprint: String)
 
@@ -83,6 +110,7 @@ data class ReaderUiState(
     val separateCover: Boolean = true,
     val panoramasAlone: Boolean = true,
     val libraryStyleId: String = LibraryStyle.default.id,
+    val readerCanvasBackgroundId: String = ReaderCanvasBackground.default.id,
     val bitmap: Bitmap? = null,
     val previousPageBitmap: Bitmap? = null,
     val nextPageBitmap: Bitmap? = null,
@@ -108,12 +136,32 @@ data class ReaderUiState(
     val isRecognizing: Boolean = false,
     val recognizedText: String? = null,
     val error: String? = null,
+    val publicationFormatId: String? = null,
+    val publicationAuthor: String? = null,
+    val publicationId: String? = null,
+    val publicationRootPath: String? = null,
+    val publicationChapters: List<PublicationChapter> = emptyList(),
+    val publicationCapabilities: PublicationCapabilities = PublicationCapabilities(),
+    val bookProgress: Float = 0f,
+    val bookFontSizeSp: Float = 20f,
+    val bookColumnMode: BookColumnMode = BookColumnMode.AUTOMATIC,
+    val bookLineSpacing: Float = 1.72f,
+    val bookMarginsDp: Float = 26f,
+    val publicationBookmarks: List<PublicationBookmark> = emptyList(),
+    val publicationHighlights: List<BookHighlightEntity> = emptyList(),
+    val bookHighlightColorId: String = BookHighlightColor.default.id,
+    val pendingBookHighlight: BookHighlightEntity? = null,
+    val publicationSearchResults: List<PublicationSearchResult> = emptyList(),
+    val isSearchingPublication: Boolean = false,
 )
 
 class EstanteViewModel(application: Application) : AndroidViewModel(application) {
     private val _state = MutableStateFlow(ReaderUiState())
     val state: StateFlow<ReaderUiState> = _state.asStateFlow()
     private val libraryRepository = ComicLibraryRepository(ComicDatabase.getInstance(application).comicDao())
+    private val bookHighlightRepository = BookHighlightRepository(ComicDatabase.getInstance(application).bookHighlightDao())
+    private val bookHighlightMutationMutex = Mutex()
+    private val publicationImporters = PublicationImportRegistry()
     private val _libraryItems = MutableStateFlow<List<LibraryComicUi>>(emptyList())
     val libraryItems: StateFlow<List<LibraryComicUi>> = _libraryItems.asStateFlow()
 
@@ -129,6 +177,9 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     private var adjacentSpreadsJob: Job? = null
     private var spreadPageJob: Job? = null
     private var openJob: Job? = null
+    private var bookProgressJob: Job? = null
+    private var bookSettingsJob: Job? = null
+    private var bookHighlightsJob: Job? = null
     private var analysisJob: Job? = null
     private var focusLastRegionOnPageLoad = false
     private var preferredRegionIndex = 0
@@ -144,6 +195,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     LibraryComicUi(
                         id = comic.id,
                         title = comic.title,
+                        formatId = comic.format.name,
                         coverPath = comic.coverPath?.let { File(getApplication<Application>().filesDir, it).absolutePath },
                         pageIndex = comic.lastPageIndex,
                         pageCount = comic.pageCount,
@@ -162,12 +214,15 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 ?.let { value -> runCatching { PageDisplayMode.valueOf(value) }.getOrNull() }
                 ?: PageDisplayMode.AUTOMATIC
             val libraryStyle = LibraryStyle.fromId(preferences[LibraryStylePreference])
+            val canvasBackground = ReaderCanvasBackground.fromId(preferences[ReaderCanvasBackgroundPreference])
             _state.value = _state.value.copy(
                 readingDirection = direction,
                 pageDisplayMode = displayMode,
                 separateCover = preferences[SeparateCoverPreference] ?: true,
                 panoramasAlone = preferences[PanoramasAlonePreference] ?: true,
                 libraryStyleId = libraryStyle.id,
+                readerCanvasBackgroundId = canvasBackground.id,
+                guidedModeEnabled = preferences[GuidedModePreference] ?: true,
             )
             val savedUri = preferences[LastDocumentUri]?.let(Uri::parse) ?: return@launch
             val savedPage = preferences[LastPageIndex] ?: 0
@@ -240,7 +295,20 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     }
                     val hash = digest.digest().joinToString("") { "%02x".format(it) }
                     val existing = libraryRepository.findByContentHash(hash)
-                    if (existing != null) return@withContext ImportResult(existing, null)
+                    if (existing != null) return@withContext ImportResult(existing, null, null)
+                    val textImporter = publicationImporters.importerFor(stage, displayName)
+                    if (textImporter != null) {
+                        return@withContext importTextPublication(
+                            stage = stage,
+                            importer = textImporter,
+                            displayName = displayName,
+                            title = title,
+                            sourceUri = uri,
+                            contentHash = hash,
+                            importId = importId,
+                            stagingDir = stagingDir,
+                        )
+                    }
                     val openedDocument = PageDocumentFactory.openFile(stage, File(app.cacheDir, "cbr-pages/$importId"))
                     preparedDocument = openedDocument
                     val document = openedDocument.document
@@ -288,10 +356,10 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     coverBytes.fill(0)
                     libraryRepository.markReady(id, hash, managed.absolutePath, pageCount, coverPath = coverRelative)
                     val comic = libraryRepository.getById(id) ?: error("O registro da estante desapareceu.")
-                    ImportResult(comic, openedDocument)
+                    ImportResult(comic, openedDocument, null)
                 }
                 staging?.delete()
-                openComic(imported.comic.id, imported.document)
+                openComic(imported.comic.id, imported.document, imported.publication)
             } catch (error: Exception) {
                 preparedDocument?.document?.close()
                 staging?.delete()
@@ -301,11 +369,89 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private data class ImportResult(val comic: ComicEntity, val document: OpenedPageDocument?)
+    private data class ImportResult(
+        val comic: ComicEntity,
+        val document: OpenedPageDocument?,
+        val publication: ImportedPublication?,
+    )
 
-    fun openComic(id: String) = openComic(id, null)
+    private suspend fun importTextPublication(
+        stage: File,
+        importer: PublicationImporter,
+        displayName: String,
+        title: String,
+        sourceUri: Uri,
+        contentHash: String,
+        importId: String,
+        stagingDir: File,
+    ): ImportResult {
+        val app = getApplication<Application>()
+        val publicationStage = File(stagingDir, "publication-$importId")
+        var rowCreated = false
+        var recordId: String? = null
+        var installedRoot: File? = null
+        try {
+            val parsed = importer.import(stage, publicationStage, title)
+            val format = ComicFormat.valueOf(parsed.formatId)
+            val priorByUri = libraryRepository.findBySourceUri(sourceUri)
+            val id = priorByUri?.takeIf { it.contentHash == null }?.id ?: contentHash
+            recordId = id
+            val comicsDir = File(app.filesDir, "library/comics").apply { if (!exists() && !mkdirs()) error("Não foi possível guardar o livro.") }
+            val extension = format.name.lowercase()
+            val contentTarget = File(comicsDir, "$contentHash.$extension")
+            val managed = if (contentTarget.exists()) contentTarget else File(comicsDir, "$id.$extension")
+            if (priorByUri == null) {
+                libraryRepository.beginImport(id, parsed.title, displayName, format, sourceUri, managed.absolutePath)
+            } else {
+                libraryRepository.upsert(priorByUri.copy(
+                    contentHash = null,
+                    title = parsed.title,
+                    displayName = displayName,
+                    format = format,
+                    managedPath = managed.absolutePath,
+                    importState = ComicImportState.IMPORTING,
+                    importError = null,
+                    pageCount = 0,
+                    coverPath = null,
+                ))
+            }
+            rowCreated = true
+            if (!contentTarget.exists() && !stage.renameTo(contentTarget)) error("Não foi possível guardar o livro importado.")
+            stage.delete()
+            val publishedFile = if (managed == contentTarget) contentTarget else {
+                if (managed.exists()) managed.delete()
+                if (!contentTarget.renameTo(managed)) error("Não foi possível finalizar o livro importado.")
+                managed
+            }
+            val publicationTarget = File(app.filesDir, "library/publications/$id")
+            publicationTarget.parentFile?.let { if (!it.exists() && !it.mkdirs()) error("Não foi possível preparar o livro para leitura.") }
+            publicationTarget.deleteRecursively()
+            if (!publicationStage.renameTo(publicationTarget)) error("Não foi possível finalizar os capítulos do livro.")
+            installedRoot = publicationTarget
+            val installed = parsed.copy(
+                root = publicationTarget,
+                coverFile = parsed.coverFile?.let { File(publicationTarget, it.relativeTo(publicationStage).path) },
+            )
+            PublicationManifestStore.save(installed)
+            val coverRelative = installed.coverFile?.let { cover ->
+                val relative = "library/covers/$id.jpg"
+                runCatching { writeCoverThumbnail(cover.readBytes(), File(app.filesDir, relative)) }.getOrNull()
+                    ?.let { relative }
+            }
+            libraryRepository.markReady(id, contentHash, publishedFile.absolutePath, installed.chapters.size, coverPath = coverRelative)
+            val comic = libraryRepository.getById(id) ?: error("O registro da estante desapareceu.")
+            return ImportResult(comic, null, installed)
+        } catch (error: Exception) {
+            publicationStage.deleteRecursively()
+            installedRoot?.deleteRecursively()
+            if (rowCreated) recordId?.let { id -> runCatching { libraryRepository.markFailed(id, friendlyError(error)) } }
+            throw error
+        }
+    }
 
-    private fun openComic(id: String, preparedDocument: OpenedPageDocument?) {
+    fun openComic(id: String) = openComic(id, null, null)
+
+    private fun openComic(id: String, preparedDocument: OpenedPageDocument?, preparedPublication: ImportedPublication?) {
         openJob?.cancel()
         openJob = viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, error = null)
@@ -320,6 +466,83 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 }
                 val file = File(comic.managedPath)
                 if (!file.isFile) error("O arquivo importado não foi encontrado; importe-o novamente.")
+                if (comic.format == ComicFormat.EPUB || comic.format == ComicFormat.MOBI) {
+                    pageDocument?.close()
+                    pageDocument = null
+                    currentComicId = comic.id
+                    sourceUri = null
+                    documentFingerprint = null
+                    val root = File(getApplication<Application>().filesDir, "library/publications/${comic.id}")
+                    val publication = preparedPublication ?: withContext(Dispatchers.IO) {
+                        PublicationManifestStore.load(root) ?: run {
+                            val importer = publicationImporters.importerFor(file, comic.displayName)
+                                ?: error("O formato deste livro não é mais compatível.")
+                            importer.import(file, root, comic.title).also(PublicationManifestStore::save)
+                        }
+                    }
+                    val preferences = getApplication<Application>().readerPreferences.data.first()
+                    val savedLocation = preferences[stringPreferencesKey("$BookLocationPrefix${comic.id}")]
+                        ?.split('|')
+                    val savedChapter = savedLocation?.getOrNull(0)?.toIntOrNull()
+                        ?: comic.lastPageIndex
+                    val chapterIndex = savedChapter.coerceIn(0, publication.chapters.lastIndex)
+                    val savedProgress = savedLocation?.getOrNull(1)?.toFloatOrNull()?.coerceIn(0f, 1f) ?: 0f
+                    val fontSize = preferences[stringPreferencesKey("$BookFontSizePrefix${comic.id}")]
+                        ?.toFloatOrNull()?.coerceIn(16f, 32f) ?: 20f
+                    val columnMode = BookColumnMode.fromId(preferences[stringPreferencesKey("$BookColumnModePrefix${comic.id}")])
+                    val lineSpacing = preferences[stringPreferencesKey("$BookLineSpacingPrefix${comic.id}")]
+                        ?.toFloatOrNull()?.coerceIn(1.3f, 2.2f) ?: 1.72f
+                    val margins = preferences[stringPreferencesKey("$BookMarginsPrefix${comic.id}")]
+                        ?.toFloatOrNull()?.coerceIn(12f, 48f) ?: 26f
+                    val bookmarks = runCatching {
+                        val array = org.json.JSONArray(preferences[stringPreferencesKey("$BookmarksPrefix${comic.id}")].orEmpty())
+                        (0 until array.length()).map { index ->
+                            val item = array.getJSONObject(index)
+                            PublicationBookmark(item.getInt("chapter"), item.getDouble("progress").toFloat(), item.getString("title"))
+                        }
+                    }.getOrDefault(emptyList())
+                    val highlightColorId = BookHighlightColor.fromId(
+                        preferences[stringPreferencesKey("$BookHighlightColorPrefix${comic.id}")],
+                    ).id
+                    val background = ReaderCanvasBackground.fromId(preferences[ReaderCanvasBackgroundPreference])
+                    getApplication<Application>().readerPreferences.edit {
+                        it[LastDocumentUri] = comic.sourceUri ?: Uri.fromFile(file).toString()
+                        it[LastPageIndex] = chapterIndex
+                    }
+                    _state.value = ReaderUiState(
+                        title = publication.title,
+                        lastReadTitle = publication.title,
+                        pageCount = publication.chapters.size,
+                        pageIndex = chapterIndex,
+                        lastReadPage = chapterIndex,
+                        libraryStyleId = _state.value.libraryStyleId,
+                        readerCanvasBackgroundId = background.id,
+                        publicationFormatId = publication.formatId,
+                        publicationAuthor = publication.author,
+                        publicationId = comic.id,
+                        publicationRootPath = publication.root.absolutePath,
+                        publicationChapters = publication.chapters,
+                        publicationCapabilities = publication.capabilities,
+                        bookProgress = savedProgress,
+                        bookFontSizeSp = fontSize,
+                        bookColumnMode = columnMode,
+                        bookLineSpacing = lineSpacing,
+                        bookMarginsDp = margins,
+                        publicationBookmarks = bookmarks,
+                        bookHighlightColorId = highlightColorId,
+                        isLoading = false,
+                    )
+                    bookHighlightsJob?.cancel()
+                    bookHighlightsJob = viewModelScope.launch {
+                        bookHighlightRepository.observeForBook(comic.id).collect { highlights ->
+                            if (_state.value.publicationId == comic.id) {
+                                _state.value = _state.value.copy(publicationHighlights = highlights)
+                            }
+                        }
+                    }
+                    libraryRepository.recordOpened(id, publication.title, publication.chapters.size, chapterIndex)
+                    return@launch
+                }
                 if (openedDocument == null) {
                     openedDocument = withContext(Dispatchers.IO) {
                         PageDocumentFactory.openFile(file, File(getApplication<Application>().cacheDir, "cbr-pages/$id"))
@@ -367,6 +590,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     pageIndex = page,
                     lastReadPage = page,
                     libraryStyleId = _state.value.libraryStyleId,
+                    readerCanvasBackgroundId = _state.value.readerCanvasBackgroundId,
+                    guidedModeEnabled = _state.value.guidedModeEnabled,
                     readingDirection = _state.value.readingDirection,
                     pageDisplayMode = comicDisplayMode,
                     separateCover = comicSeparateCover,
@@ -394,10 +619,26 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     fun removeComic(id: String) {
         viewModelScope.launch {
             val comic = libraryRepository.getById(id) ?: return@launch
-            if (currentComicId == id) closeDocument()
+            if (currentComicId == id) {
+                bookProgressJob?.cancel()
+                bookSettingsJob?.cancel()
+                closeDocument()
+            }
             libraryRepository.remove(id)
             comic.managedPath?.let { File(it).delete() }
             comic.coverPath?.let { File(getApplication<Application>().filesDir, it).delete() }
+            File(getApplication<Application>().filesDir, "library/publications/$id").deleteRecursively()
+            getApplication<Application>().readerPreferences.edit { preferences ->
+                preferences.remove(stringPreferencesKey("$BookLocationPrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookFontSizePrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookColumnModePrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookLineSpacingPrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookMarginsPrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookmarksPrefix$id"))
+                preferences.remove(stringPreferencesKey("$BookHighlightColorPrefix$id"))
+                preferences.remove(stringPreferencesKey("page_display_mode_$id"))
+                preferences.remove(booleanPreferencesKey("separate_cover_$id"))
+            }
         }
     }
 
@@ -443,6 +684,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         adjacentSpreadsJob?.cancel()
         spreadPageJob?.cancel()
         analysisJob?.cancel()
+        bookHighlightsJob?.cancel()
         closePageDocument()
         sourceUri = null
         documentFingerprint = null
@@ -462,6 +704,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             lastReadTitle = current.title ?: current.lastReadTitle,
             lastReadPage = current.pageIndex.takeIf { current.title != null } ?: current.lastReadPage,
             libraryStyleId = current.libraryStyleId,
+            readerCanvasBackgroundId = current.readerCanvasBackgroundId,
+            guidedModeEnabled = current.guidedModeEnabled,
         )
     }
 
@@ -491,6 +735,260 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun recordBookProgress(chapterIndex: Int, progression: Float) {
+        val current = _state.value
+        if (current.publicationRootPath == null || chapterIndex !in current.publicationChapters.indices) return
+        val safeProgress = progression.coerceIn(0f, 1f)
+        if (current.pageIndex != chapterIndex || kotlin.math.abs(current.bookProgress - safeProgress) > 0.01f) {
+            _state.value = current.copy(pageIndex = chapterIndex, lastReadPage = chapterIndex, bookProgress = safeProgress)
+        }
+        val id = currentComicId ?: return
+        bookProgressJob?.cancel()
+        bookProgressJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(500)
+            getApplication<Application>().readerPreferences.edit { preferences ->
+                preferences[stringPreferencesKey("$BookLocationPrefix$id")] = "$chapterIndex|$safeProgress"
+                preferences[LastPageIndex] = chapterIndex
+            }
+            libraryRepository.updateProgress(id, chapterIndex)
+        }
+    }
+
+    fun goToBookChapter(index: Int) {
+        val current = _state.value
+        if (index !in current.publicationChapters.indices) return
+        recordBookProgress(index, 0f)
+        currentComicId?.let { id ->
+            viewModelScope.launch {
+                libraryRepository.recordOpened(id, current.title ?: "Livro", current.pageCount, index)
+            }
+        }
+    }
+
+    fun setBookFontSize(sizeSp: Float) {
+        val size = sizeSp.coerceIn(16f, 32f)
+        _state.value = _state.value.copy(bookFontSizeSp = size)
+        persistBookSettings()
+    }
+
+    fun setBookLineSpacing(value: Float) {
+        val spacing = value.coerceIn(1.3f, 2.2f)
+        _state.value = _state.value.copy(bookLineSpacing = spacing)
+        persistBookSettings()
+    }
+
+    fun setBookMargins(valueDp: Float) {
+        val margins = valueDp.coerceIn(12f, 48f)
+        _state.value = _state.value.copy(bookMarginsDp = margins)
+        persistBookSettings()
+    }
+
+    fun setBookColumnMode(mode: BookColumnMode) {
+        _state.value = _state.value.copy(bookColumnMode = mode)
+        persistBookSettings()
+    }
+
+    private fun persistBookSettings() {
+        val id = currentComicId ?: return
+        val settings = _state.value
+        bookSettingsJob?.cancel()
+        bookSettingsJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(250)
+            getApplication<Application>().readerPreferences.edit { preferences ->
+                preferences[stringPreferencesKey("$BookFontSizePrefix$id")] = settings.bookFontSizeSp.toString()
+                preferences[stringPreferencesKey("$BookLineSpacingPrefix$id")] = settings.bookLineSpacing.toString()
+                preferences[stringPreferencesKey("$BookMarginsPrefix$id")] = settings.bookMarginsDp.toString()
+                preferences[stringPreferencesKey("$BookColumnModePrefix$id")] = settings.bookColumnMode.id
+            }
+        }
+    }
+
+    fun addBookBookmark() {
+        val current = _state.value
+        val chapter = current.publicationChapters.getOrNull(current.pageIndex) ?: return
+        val title = "${chapter.title} · ${(current.bookProgress * 100).toInt()}%"
+        val bookmark = PublicationBookmark(current.pageIndex, current.bookProgress, title)
+        val updated = (current.publicationBookmarks + bookmark).distinctBy { it.chapterIndex to (it.progression * 100).toInt() }
+        _state.value = current.copy(publicationBookmarks = updated)
+        currentComicId?.let { id -> viewModelScope.launch {
+            val array = org.json.JSONArray()
+            updated.forEach { item -> array.put(org.json.JSONObject().put("chapter", item.chapterIndex).put("progress", item.progression).put("title", item.title)) }
+            getApplication<Application>().readerPreferences.edit { it[stringPreferencesKey("$BookmarksPrefix$id")] = array.toString() }
+        } }
+    }
+
+    /** Saves the browser's final text selection without interrupting the selection gesture. */
+    fun addBookHighlight(
+        chapterHref: String,
+        selectedText: String,
+        startOffset: Int,
+        endOffset: Int,
+        prefix: String,
+        suffix: String,
+    ) {
+        val current = _state.value
+        val bookId = current.publicationId ?: return
+        val chapterIndex = current.publicationChapters.indexOfFirst { it.href == chapterHref }
+        val quote = selectedText.trim().take(MAX_HIGHLIGHT_TEXT_LENGTH)
+        if (chapterIndex < 0 || quote.length < MIN_HIGHLIGHT_TEXT_LENGTH ||
+            startOffset < 0 || endOffset <= startOffset || endOffset - startOffset > MAX_HIGHLIGHT_TEXT_LENGTH + 64
+        ) return
+        if (current.publicationHighlights.any {
+                it.chapterHref == chapterHref && it.startOffset == startOffset && it.endOffset == endOffset
+            }
+        ) return
+
+        val highlight = BookHighlightEntity(
+            id = UUID.randomUUID().toString(),
+            bookId = bookId,
+            chapterIndex = chapterIndex,
+            chapterHref = chapterHref,
+            startOffset = startOffset,
+            endOffset = endOffset,
+            selectedText = quote,
+            prefix = prefix.takeLast(HIGHLIGHT_CONTEXT_LENGTH),
+            suffix = suffix.take(HIGHLIGHT_CONTEXT_LENGTH),
+            colorId = BookHighlightColor.fromId(current.bookHighlightColorId).id,
+            createdAt = System.currentTimeMillis(),
+        )
+        _state.value = current.copy(
+            publicationHighlights = (current.publicationHighlights + highlight)
+                .sortedWith(compareBy<BookHighlightEntity> { it.chapterIndex }.thenBy { it.startOffset }),
+        )
+        viewModelScope.launch {
+            runCatching {
+                bookHighlightMutationMutex.withLock {
+                    withContext(Dispatchers.IO) { bookHighlightRepository.insert(highlight) }
+                }
+            }
+                .onFailure {
+                    if (_state.value.publicationId == bookId) {
+                        _state.value = _state.value.copy(
+                            publicationHighlights = _state.value.publicationHighlights.filterNot { it.id == highlight.id },
+                            error = "Não foi possível salvar este grifo.",
+                        )
+                    }
+                }
+        }
+    }
+
+    fun setBookHighlightColor(colorId: String) {
+        val color = BookHighlightColor.fromId(colorId)
+        val current = _state.value
+        val bookId = current.publicationId ?: return
+        if (current.bookHighlightColorId == color.id) return
+        _state.value = current.copy(bookHighlightColorId = color.id)
+        viewModelScope.launch {
+            getApplication<Application>().readerPreferences.edit {
+                it[stringPreferencesKey("$BookHighlightColorPrefix$bookId")] = color.id
+            }
+        }
+    }
+
+    fun changeBookHighlightColor(highlightId: String, colorId: String) {
+        val color = BookHighlightColor.fromId(colorId)
+        val current = _state.value
+        val bookId = current.publicationId ?: return
+        val previous = current.publicationHighlights.firstOrNull { it.id == highlightId } ?: return
+        _state.value = current.copy(publicationHighlights = current.publicationHighlights.map {
+            if (it.id == highlightId) it.copy(colorId = color.id) else it
+        })
+        viewModelScope.launch {
+            val updated = withContext(Dispatchers.IO) {
+                bookHighlightMutationMutex.withLock { bookHighlightRepository.updateColor(highlightId, bookId, color.id) }
+            }
+            if (updated == 0 && _state.value.publicationId == bookId) {
+                _state.value = _state.value.copy(publicationHighlights = _state.value.publicationHighlights.map {
+                    if (it.id == highlightId) previous else it
+                })
+            }
+        }
+    }
+
+    fun removeBookHighlight(highlightId: String) {
+        val current = _state.value
+        val bookId = current.publicationId ?: return
+        if (current.publicationHighlights.none { it.id == highlightId }) return
+        _state.value = current.copy(publicationHighlights = current.publicationHighlights.filterNot { it.id == highlightId })
+        viewModelScope.launch {
+            bookHighlightMutationMutex.withLock {
+                withContext(Dispatchers.IO) { bookHighlightRepository.delete(highlightId, bookId) }
+            }
+        }
+    }
+
+    fun restoreBookHighlight(highlight: BookHighlightEntity) {
+        val current = _state.value
+        if (current.publicationId != highlight.bookId || current.publicationHighlights.any { it.id == highlight.id }) return
+        _state.value = current.copy(
+            publicationHighlights = (current.publicationHighlights + highlight)
+                .sortedWith(compareBy<BookHighlightEntity> { it.chapterIndex }.thenBy { it.startOffset }),
+        )
+        viewModelScope.launch {
+            runCatching {
+                bookHighlightMutationMutex.withLock {
+                    withContext(Dispatchers.IO) { bookHighlightRepository.insert(highlight) }
+                }
+            }
+        }
+    }
+
+    fun openBookHighlight(highlightId: String) {
+        val highlight = _state.value.publicationHighlights.firstOrNull { it.id == highlightId } ?: return
+        recordBookProgress(highlight.chapterIndex, 0f)
+        _state.value = _state.value.copy(pendingBookHighlight = highlight)
+    }
+
+    fun clearPendingBookHighlight(highlightId: String) {
+        if (_state.value.pendingBookHighlight?.id == highlightId) {
+            _state.value = _state.value.copy(pendingBookHighlight = null)
+        }
+    }
+
+    fun searchPublication(query: String) {
+        val current = _state.value
+        val rootPath = current.publicationRootPath ?: return
+        val term = query.trim()
+        if (term.isEmpty()) {
+            _state.value = current.copy(publicationSearchResults = emptyList(), isSearchingPublication = false)
+            return
+        }
+        val publicationId = current.publicationId
+        _state.value = current.copy(isSearchingPublication = true, publicationSearchResults = emptyList())
+        viewModelScope.launch {
+            val results = withContext(Dispatchers.IO) {
+                val root = File(rootPath).canonicalFile
+                buildList {
+                    current.publicationChapters.forEachIndexed { chapterIndex, chapter ->
+                        if (size >= 40) return@forEachIndexed
+                        val source = File(root, chapter.href).canonicalFile
+                        if (!source.path.startsWith(root.path + File.separator) || !source.isFile) return@forEachIndexed
+                        val text = runCatching { org.jsoup.Jsoup.parse(source, "UTF-8").text() }.getOrNull().orEmpty()
+                        if (text.isEmpty()) return@forEachIndexed
+                        val regex = Regex(Regex.escape(term), RegexOption.IGNORE_CASE)
+                        var cursor = 0
+                        while (size < 40) {
+                            val match = regex.find(text, cursor) ?: break
+                            val start = (match.range.first - 72).coerceAtLeast(0)
+                            val end = (match.range.last + 73).coerceAtMost(text.length)
+                            add(PublicationSearchResult(
+                                chapterIndex = chapterIndex,
+                                progression = (match.range.first.toFloat() / text.length).coerceIn(0f, 1f),
+                                title = chapter.title,
+                                snippet = text.substring(start, end).replace(Regex("\\s+"), " "),
+                            ))
+                            cursor = match.range.last + 1
+                        }
+                        if (size >= 40) return@forEachIndexed
+                    }
+                }
+            }
+            if (_state.value.publicationId == publicationId) {
+                _state.value = _state.value.copy(publicationSearchResults = results, isSearchingPublication = false)
+            }
+        }
+    }
+
     fun setPageDisplayMode(mode: PageDisplayMode) {
         val current = _state.value
         _state.value = current.copy(pageDisplayMode = mode)
@@ -508,6 +1006,15 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             getApplication<Application>().readerPreferences.edit { preferences ->
                 preferences[LibraryStylePreference] = style.id
+            }
+        }
+    }
+
+    fun setReaderCanvasBackground(background: ReaderCanvasBackground) {
+        _state.value = _state.value.copy(readerCanvasBackgroundId = background.id)
+        viewModelScope.launch {
+            getApplication<Application>().readerPreferences.edit { preferences ->
+                preferences[ReaderCanvasBackgroundPreference] = background.id
             }
         }
     }
@@ -639,6 +1146,9 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
 
     fun setGuidedModeEnabled(enabled: Boolean) {
         _state.value = _state.value.copy(guidedModeEnabled = enabled)
+        viewModelScope.launch {
+            getApplication<Application>().readerPreferences.edit { it[GuidedModePreference] = enabled }
+        }
     }
 
     fun setReadingDirection(direction: ReadingDirection) {
