@@ -142,6 +142,7 @@ internal fun BookReaderScreen(
     val latestOnTextSelection by rememberUpdatedState(onTextSelection)
     val latestOnPendingConsumed by rememberUpdatedState(onPendingHighlightConsumed)
     val webView = remember(bookId) { mutableStateOf<WebView?>(null) }
+    val pageTurn = remember(bookId) { BookPageTurnController() }
     val snackbarHostState = remember(bookId) { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
 
@@ -189,6 +190,10 @@ internal fun BookReaderScreen(
                         if (next in chapters.indices) latestOnProgress(next, if (direction > 0) 0f else 1f)
                     } },
                     pagination = { page, total -> post { visiblePage = page to total } },
+                    requestTurn = { direction -> post {
+                        pageTurn.request(this, direction, latestChapterIndex + direction in chapters.indices)
+                    } },
+                    ready = { post { pageTurn.chapterReady(this) } },
                 ), "EstanteProgress")
                 addJavascriptInterface(BookSelectionBridge(
                     reportSelection = { href, text, start, end, prefix, suffix ->
@@ -209,8 +214,11 @@ internal fun BookReaderScreen(
                     pendingHighlight = { latestPendingHighlight },
                     onPendingHighlightConsumed = { id -> latestOnPendingConsumed(id) },
                     onChapterLoadStarted = { chapterLoadError = null },
-                    onChapterLoadError = { message -> chapterLoadError = message },
+                    onChapterLoadError = { message -> pageTurn.cancel(); chapterLoadError = message },
                 )
+                addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+                    if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) pageTurn.cancel()
+                }
                 var downX = 0f
                 var downY = 0f
                 var downTime = 0L
@@ -252,6 +260,11 @@ internal fun BookReaderScreen(
         },
     )
 
+    BookPageTurnOverlay(
+        pageTurn, background,
+        Modifier.then(if (widePanelOpen) Modifier.padding(end = panelWidth) else Modifier),
+    )
+
     chapterLoadError?.let { message ->
         Surface(
             modifier = Modifier.align(Alignment.Center).padding(24.dp),
@@ -280,6 +293,7 @@ internal fun BookReaderScreen(
     val currentWebView = webView.value
     DisposableEffect(currentWebView) {
         onDispose {
+            pageTurn.cancel()
             currentWebView?.apply {
                 stopLoading()
                 removeJavascriptInterface("EstanteProgress")
@@ -289,11 +303,12 @@ internal fun BookReaderScreen(
         }
     }
 
-    LaunchedEffect(fontSizeSp, lineSpacing, marginsDp, twoColumns, background, chapterIndex) {
+    LaunchedEffect(fontSizeSp, lineSpacing, marginsDp, twoColumns, background) {
         delay(250)
+        pageTurn.cancel()
         webView.value?.applyReaderStyle(
             ReaderWebStyle(fontSizeSp, twoColumns, background, lineSpacing, marginsDp),
-            chapterIndex,
+            latestChapterIndex,
             latestHighlights,
             latestPendingHighlight,
         ) { id -> latestOnPendingConsumed(id) }
@@ -553,7 +568,11 @@ private class BookProgressBridge(
     private val report: (Int, Float) -> Unit,
     private val turnChapter: (Int) -> Unit,
     private val pagination: (Int, Int) -> Unit,
+    private val requestTurn: (Int) -> Unit,
+    private val ready: () -> Unit,
 ) {
+    @JavascriptInterface fun onTurnRequested(direction: Int) { if (direction == -1 || direction == 1) requestTurn(direction) }
+    @JavascriptInterface fun onReady() { ready() }
     @JavascriptInterface fun onChapterBoundary(direction: Int) { if (direction == -1 || direction == 1) turnChapter(direction) }
     @JavascriptInterface fun onPagination(page: Int, total: Int) { if (page in 1..total) pagination(page, total) }
 
@@ -691,7 +710,25 @@ internal fun WebView.applyReaderStyle(
     val background = style.background.color.toArgb().toUInt().toString(16).padStart(8, '0').takeLast(6)
     val text = if (style.background == ReaderCanvasBackground.DARK) "#F2EEE6" else "#292722"
     val columnCount = if (style.twoColumns) 2 else 1
-    val css = """html{height:100%;overflow:hidden!important;}html,body{background:#$background!important;color:$text!important;}body{font-family:Georgia,'Noto Serif',serif!important;font-size:${style.fontSizeSp}px!important;line-height:${style.lineSpacing}!important;width:100vw!important;max-width:none!important;height:100vh!important;min-height:0!important;margin:0!important;padding:28px ${style.marginsDp}px!important;box-sizing:border-box;column-count:$columnCount!important;column-gap:${style.marginsDp * 2}px!important;column-fill:auto!important;overflow:visible!important;}img,svg,video{max-width:100%!important;max-height:calc(100vh - 56px)!important;height:auto!important;object-fit:contain;}a{color:#A95138!important;}.estante-highlight{color:inherit!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:.15em;-webkit-tap-highlight-color:transparent;}.estante-highlight-focus{outline:2px solid #A95138;outline-offset:2px;}"""
+    val css = """
+        html{height:100%;overflow:hidden!important;font-size:${style.fontSizeSp}px!important;-webkit-text-size-adjust:100%;text-size-adjust:100%;}
+        html,body{background:#$background!important;color:$text!important;}
+        body{font-family:Georgia,'Noto Serif',serif!important;font-size:1rem!important;line-height:${style.lineSpacing}!important;width:100vw!important;max-width:none!important;height:100vh!important;min-height:0!important;margin:0!important;box-sizing:border-box;}
+        #estante-content{font-size:1rem;line-height:${style.lineSpacing};overflow-wrap:anywhere;}
+        #estante-content :is(p,li,dt,dd,blockquote){font-size:1rem!important;line-height:${style.lineSpacing}!important;}
+        #estante-content :is(p,li,dt,dd,blockquote) :is(span,a,strong,em,b,i){font-size:inherit!important;line-height:inherit!important;}
+        #estante-content .estante-prose{text-align:start!important;}
+        #estante-content :is(h1,h2,h3,h4,h5,h6,[data-estante-heading]){line-height:1.25!important;overflow-wrap:anywhere;hyphens:auto;break-after:avoid;}
+        #estante-content :is(h1,[data-estante-heading=large]){font-size:1.8rem!important;}
+        #estante-content :is(h2,[data-estante-heading=medium]){font-size:1.4rem!important;}
+        #estante-content :is(h3,h4,h5,h6){font-size:1.15rem!important;}
+        #estante-content :is(p,li){orphans:2;widows:2;}
+        img,svg,video{max-width:100%!important;max-height:calc(100vh - 56px)!important;height:auto!important;object-fit:contain;break-inside:avoid;}
+        pre{white-space:pre-wrap!important;}table{max-width:100%;}a{color:#A95138!important;word-break:normal!important;}
+        .estante-highlight{color:inherit!important;box-decoration-break:clone;-webkit-box-decoration-break:clone;border-radius:.15em;-webkit-tap-highlight-color:transparent;}
+        .estante-highlight-focus{outline:2px solid #A95138;outline-offset:2px;}
+    """.trimIndent()
+
     val chapterHighlights = highlights.asSequence().filter { it.chapterIndex == chapterIndex }.map { item ->
         org.json.JSONObject()
             .put("id", item.id)
@@ -706,6 +743,18 @@ internal fun WebView.applyReaderStyle(
     val target = pendingHighlight?.takeIf { it.chapterIndex == chapterIndex }?.id?.let(org.json.JSONObject::quote) ?: "null"
     val script = """
         (function(){
+          var previousProgress=window.estanteProgressValue,hadLayout=!!window.estanteLayoutPages;
+          // Publisher paragraphs can be tiny body copy or enormous display titles.
+          // Classify once before reader CSS overrides them, preserving semantic emphasis.
+          if(!window.estanteTypographyReady){
+            document.querySelectorAll('p').forEach(function(p){
+              var text=p.textContent.trim(),size=parseFloat(getComputedStyle(p).fontSize),base=parseFloat(getComputedStyle(document.body).fontSize)||16;
+              if(text.length>180)p.classList.add('estante-prose');
+              else if(size/base>1.25)p.dataset.estanteHeading=size/base>2?'large':'medium';
+            });
+            if(!document.documentElement.lang&&document.documentElement.getAttribute('xml:lang'))document.documentElement.lang=document.documentElement.getAttribute('xml:lang');
+            window.estanteTypographyReady=true;
+          }
           var viewport=document.querySelector('meta[name=viewport]');if(!viewport){viewport=document.createElement('meta');viewport.name='viewport';document.head.appendChild(viewport);}viewport.content='width=device-width,initial-scale=1';
           var style=document.getElementById('estante-reader-style');
           if(!style){style=document.createElement('style');style.id='estante-reader-style';document.head.appendChild(style);}
@@ -716,11 +765,13 @@ internal fun WebView.applyReaderStyle(
           if(window.estanteProgressTimer){clearInterval(window.estanteProgressTimer);}
           function pageCount(){var count=Math.max(1,Math.ceil((content.scrollWidth-1)/window.estantePageWidth));var end=document.getElementById('estante-page-end');if(!end){end=document.createElement('div');end.id='estante-page-end';end.setAttribute('aria-hidden','true');pager.appendChild(end);}end.style.cssText='position:absolute;top:0;left:'+(count*window.estantePageWidth-1)+'px;width:1px;height:1px;pointer-events:none;';return count;}
           function reportPage(){var count=pageCount(),page=Math.min(count-1,Math.round(pager.scrollLeft/window.estantePageWidth));window.estanteProgressValue=count>1?page/(count-1):0;EstanteProgress.onPagination(page+1,count);EstanteProgress.onProgress($chapterIndex,window.estanteProgressValue);}
-          window.estanteRestoreProgress=function(p){var page=Math.round(Math.max(0,Math.min(1,p))*(pageCount()-1));pager.scrollTo({left:page*window.estantePageWidth,top:0,behavior:'instant'});reportPage();};
-          window.estanteTurnPage=function(direction){var next=Math.round(pager.scrollLeft/window.estantePageWidth)+direction,count=pageCount();if(next<0||next>=count){EstanteProgress.onChapterBoundary(direction);return;}pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});clearTimeout(window.estanteTurnTimer);window.estanteTurnTimer=setTimeout(function(){pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:'instant'});reportPage();},350);};
+          window.estanteRestoreProgress=function(p){var page=Math.round(Math.max(0,Math.min(1,p))*(pageCount()-1));pager.scrollTo({left:page*window.estantePageWidth,top:0,behavior:'instant'});reportPage();requestAnimationFrame(function(){if(EstanteProgress.onReady)EstanteProgress.onReady();});};
+          window.estanteCommitTurnPage=function(direction){var next=Math.round(pager.scrollLeft/window.estantePageWidth)+direction,count=pageCount();if(next<0||next>=count)return 'boundary';pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:'instant'});reportPage();return 'turned';};
+          window.estanteTurnPage=function(direction){if(!getSelection().isCollapsed)return;if(EstanteProgress.onTurnRequested){EstanteProgress.onTurnRequested(direction);}else if(window.estanteCommitTurnPage(direction)==='boundary'){EstanteProgress.onChapterBoundary(direction);}};
           window.estanteProgressTimer=setInterval(reportPage,1200);
           if(!window.estanteSwipeListener){var startX=0,startY=0,startTime=0;document.addEventListener('touchstart',function(e){if(e.touches.length!==1)return;startX=e.touches[0].clientX;startY=e.touches[0].clientY;startTime=Date.now();},{passive:true});document.addEventListener('touchend',function(e){if(!e.changedTouches.length)return;var dx=e.changedTouches[0].clientX-startX,dy=e.changedTouches[0].clientY-startY;if(Date.now()-startTime<600&&Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)*1.5&&getSelection().isCollapsed){e.preventDefault();window.estanteTurnPage(dx<0?1:-1);}},{passive:false});window.estanteSwipeListener=true;}
           if(!window.estanteResizeHandler){window.estanteResizeHandler=function(){var p=window.estanteProgressValue||0;window.estanteLayoutPages();requestAnimationFrame(function(){window.estanteRestoreProgress(p);});};addEventListener('resize',window.estanteResizeHandler);}
+          if(hadLayout&&previousProgress!=null&&$target===null)requestAnimationFrame(function(){window.estanteRestoreProgress(previousProgress);});
           requestAnimationFrame(function(){EstanteProgress.onPagination(Math.round(pager.scrollLeft/window.estantePageWidth)+1,pageCount());});
           document.querySelectorAll('[data-estante-highlight]').forEach(function(mark){var parent=mark.parentNode;if(!parent)return;while(mark.firstChild)parent.insertBefore(mark.firstChild,mark);parent.removeChild(mark);});
           if(document.body)document.body.normalize();
