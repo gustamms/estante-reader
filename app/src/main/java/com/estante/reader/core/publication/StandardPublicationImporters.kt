@@ -1,6 +1,8 @@
 package com.estante.reader.core.publication
 
 import org.jsoup.Jsoup
+import org.jsoup.parser.Parser
+import org.jsoup.nodes.Element
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -8,7 +10,6 @@ import java.io.RandomAccessFile
 import java.nio.charset.Charset
 import java.util.Locale
 import java.util.zip.ZipFile
-import javax.xml.parsers.DocumentBuilderFactory
 
 class EpubImporter : PublicationImporter {
     override val formatId: String = "EPUB"
@@ -28,41 +29,41 @@ class EpubImporter : PublicationImporter {
                 val container = zip.getEntry("META-INF/container.xml")
                     ?: throw UnsupportedPublicationException("Este EPUB não contém o índice de publicação.")
                 val rootPath = parseXml(zip.getInputStream(container).use { it.readBytes() })
-                    .elements("rootfile").firstOrNull()?.getAttribute("full-path")
+                    .elements("rootfile").firstOrNull()?.attr("full-path")
                     ?.takeIf(String::isNotBlank)
                     ?: throw UnsupportedPublicationException("Não foi possível localizar a estrutura do EPUB.")
                 val opfFile = safeFile(destination, rootPath)
                 val opf = parseXml(opfFile.readBytes())
                 val opfDirectory = rootPath.substringBeforeLast('/', "")
-                val manifest = opf.elements("item").associateBy { it.getAttribute("id") }
+                val manifest = opf.elements("item").associateBy { it.attr("id") }
                 if (manifest.isEmpty()) throw UnsupportedPublicationException("O EPUB não contém capítulos legíveis.")
 
                 val metadata = opf.elements("metadata").firstOrNull()
-                val layout = metadata?.elements("meta")?.firstOrNull { it.getAttribute("property") == "rendition:layout" }
-                    ?.textContent?.trim()?.lowercase(Locale.ROOT)
+                val layout = metadata?.elements("meta")?.firstOrNull { it.attr("property") == "rendition:layout" }
+                    ?.text()?.trim()?.lowercase(Locale.ROOT)
                 if (layout == "pre-paginated") {
                     throw UnsupportedPublicationException("Este EPUB usa layout fixo. No momento, o leitor aceita livros de texto fluido.")
                 }
                 zip.getEntry("META-INF/encryption.xml")?.let { entry ->
                     val encrypted = parseXml(zip.getInputStream(entry).use { it.readBytes() }).elements("EncryptionMethod")
                     val unsupported = encrypted.any { method ->
-                        method.getAttribute("Algorithm") !in setOf(
+                        method.attr("Algorithm") !in setOf(
                             "http://www.idpf.org/2008/embedding",
                             "http://ns.adobe.com/pdf/enc#RC",
                         )
                     }
                     if (unsupported) throw UnsupportedPublicationException("Este EPUB parece protegido por DRM e não pode ser aberto.")
                 }
-                val title = metadata?.elements("title")?.firstOrNull()?.textContent?.trim()
+                val title = metadata?.elements("title")?.firstOrNull()?.text()?.trim()
                     ?.takeIf(String::isNotBlank) ?: fallbackTitle
-                val author = metadata?.elements("creator")?.firstOrNull()?.textContent?.trim()
+                val author = metadata?.elements("creator")?.firstOrNull()?.text()?.trim()
                     ?.takeIf(String::isNotBlank)
 
                 val navItem = manifest.values.firstOrNull { item ->
-                    item.getAttribute("properties").split(Regex("\\s+")).contains("nav")
+                    item.attr("properties").split(Regex("\\s+")).contains("nav")
                 }
                 val epub3Titles = navItem?.let { item ->
-                    val navPath = joinPath(opfDirectory, item.getAttribute("href"))
+                    val navPath = joinPath(opfDirectory, item.attr("href"))
                     val navFile = safeFile(destination, navPath)
                     if (navFile.isFile) {
                         Jsoup.parse(navFile, "UTF-8").select("nav a[href]")
@@ -73,16 +74,16 @@ class EpubImporter : PublicationImporter {
                     } else emptyMap()
                 }.orEmpty()
                 val spineElement = opf.elements("spine").firstOrNull()
-                val epub2TocItem = spineElement?.getAttribute("toc")?.let(manifest::get)
+                val epub2TocItem = spineElement?.attr("toc")?.let(manifest::get)
                 val epub2Titles = epub2TocItem?.let { item ->
-                    val ncxPath = joinPath(opfDirectory, item.getAttribute("href"))
+                    val ncxPath = joinPath(opfDirectory, item.attr("href"))
                     val ncxFile = safeFile(destination, ncxPath)
                     if (ncxFile.isFile) {
                         parseXml(ncxFile.readBytes()).elements("navPoint").mapNotNull { point ->
-                            val href = point.elements("content").firstOrNull()?.getAttribute("src")
+                            val href = point.elements("content").firstOrNull()?.attr("src")
                                 ?.takeIf(String::isNotBlank) ?: return@mapNotNull null
                             val label = point.elements("navLabel").firstOrNull()?.elements("text")?.firstOrNull()
-                                ?.textContent?.trim().orEmpty()
+                                ?.text()?.trim().orEmpty()
                             joinPath(ncxPath.substringBeforeLast('/', ""), href) to label
                         }.toMap()
                     } else emptyMap()
@@ -90,10 +91,10 @@ class EpubImporter : PublicationImporter {
                 val tocTitles = epub3Titles + epub2Titles
 
                 val spine = opf.elements("itemref").mapNotNull { itemref ->
-                    manifest[itemref.getAttribute("idref")]
+                    manifest[itemref.attr("idref")]
                 }
                 val chapters = spine.mapNotNull { item ->
-                    val href = joinPath(opfDirectory, item.getAttribute("href").substringBefore('#'))
+                    val href = joinPath(opfDirectory, item.attr("href").substringBefore('#'))
                     val chapterFile = safeFile(destination, href)
                     if (!chapterFile.isFile || chapterFile.length() > MAX_CHAPTER_BYTES) return@mapNotNull null
                     val sanitized = sanitizeHtml(chapterFile.readText(Charsets.UTF_8))
@@ -103,10 +104,10 @@ class EpubImporter : PublicationImporter {
                 }
                 if (chapters.isEmpty()) throw UnsupportedPublicationException("Este EPUB não tem capítulos de texto compatíveis.")
 
-                val coverItem = manifest.values.firstOrNull { it.getAttribute("properties").split(Regex("\\s+")).contains("cover-image") }
-                    ?: metadata?.elements("meta")?.firstOrNull { it.getAttribute("name") == "cover" }
-                        ?.let { meta -> manifest[meta.getAttribute("content")] }
-                val cover = coverItem?.let { safeFile(destination, joinPath(opfDirectory, it.getAttribute("href"))) }
+                val coverItem = manifest.values.firstOrNull { it.attr("properties").split(Regex("\\s+")).contains("cover-image") }
+                    ?: metadata?.elements("meta")?.firstOrNull { it.attr("name") == "cover" }
+                        ?.let { meta -> manifest[meta.attr("content")] }
+                val cover = coverItem?.let { safeFile(destination, joinPath(opfDirectory, it.attr("href"))) }
                     ?.takeIf { it.isFile && it.length() in 1..MAX_COVER_BYTES }
 
                 return ImportedPublication(formatId, title, author, chapters, destination, cover)
@@ -153,29 +154,19 @@ class EpubImporter : PublicationImporter {
         }
     }
 
-    private fun parseXml(bytes: ByteArray): org.w3c.dom.Document {
-        val factory = DocumentBuilderFactory.newInstance().apply {
-            isNamespaceAware = true
-            isXIncludeAware = false
-            isExpandEntityReferences = false
-            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-            setFeature("http://xml.org/sax/features/external-general-entities", false)
-            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-            runCatching { setAttribute("http://javax.xml.XMLConstants/property/accessExternalDTD", "") }
-            runCatching { setAttribute("http://javax.xml.XMLConstants/property/accessExternalSchema", "") }
-        }
-        return factory.newDocumentBuilder().parse(bytes.inputStream())
-    }
+    /**
+     * Jsoup's XML parser is available on Android and does not resolve external
+     * entities. JAXP's Android implementation rejects the security features this
+     * importer needs to configure, so using it makes valid EPUB XML fail to parse.
+     */
+    private fun parseXml(bytes: ByteArray): org.jsoup.nodes.Document =
+        Jsoup.parse(bytes.inputStream(), null, "", Parser.xmlParser())
 
-    private fun org.w3c.dom.Document.elements(name: String) =
-        getElementsByTagNameNS("*", name).let { nodes ->
-            if (nodes.length > 0) nodes else getElementsByTagName(name)
-        }.let { nodes -> (0 until nodes.length).mapNotNull { nodes.item(it) as? org.w3c.dom.Element } }
+    private fun org.jsoup.nodes.Document.elements(name: String) =
+        getAllElements().filter { it !== this && it.tagName().substringAfter(':').equals(name, ignoreCase = true) }
 
-    private fun org.w3c.dom.Element.elements(name: String) =
-        getElementsByTagNameNS("*", name).let { nodes ->
-            if (nodes.length > 0) nodes else getElementsByTagName(name)
-        }.let { nodes -> (0 until nodes.length).mapNotNull { nodes.item(it) as? org.w3c.dom.Element } }
+    private fun Element.elements(name: String) =
+        getAllElements().filter { it !== this && it.tagName().substringAfter(':').equals(name, ignoreCase = true) }
 
     private fun joinPath(base: String, href: String): String {
         val cleanHref = href.substringBefore('?').substringBefore('#').replace('\\', '/')
