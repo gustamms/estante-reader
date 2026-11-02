@@ -14,9 +14,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -45,11 +48,13 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -68,6 +73,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -81,8 +87,10 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.IntOffset
@@ -149,9 +157,12 @@ class MainActivity : ComponentActivity() {
 private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val comics by viewModel.libraryItems.collectAsStateWithLifecycle()
+    var showSettings by remember { mutableStateOf(false) }
     val documentPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument(),
     ) { uri -> uri?.let(viewModel::openDocument) }
+
+    BackHandler(enabled = showSettings) { showSettings = false }
 
     if (state.title != null && state.pageCount > 0) {
         ComicReaderScreen(
@@ -188,6 +199,12 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             onLoadSpreadPage = viewModel::loadSpreadPage,
             onLoadNeighborSpreads = viewModel::loadNeighborSpreads,
         )
+    } else if (showSettings) {
+        LibraryAppearanceScreen(
+            selectedStyleId = state.libraryStyleId,
+            onApplyStyle = viewModel::setLibraryStyle,
+            onBack = { showSettings = false },
+        )
     } else {
         LibraryScreen(
             state = state,
@@ -195,6 +212,7 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             comics = comics,
             onOpenComic = viewModel::openComic,
             onDeleteComic = viewModel::removeComic,
+            onOpenSettings = { showSettings = true },
         )
     }
 }
@@ -206,98 +224,126 @@ private fun LibraryScreen(
     comics: List<LibraryComicUi>,
     onOpenComic: (String) -> Unit,
     onDeleteComic: (String) -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     var comicToDelete by remember { mutableStateOf<LibraryComicUi?>(null) }
-    Surface(modifier = Modifier.fillMaxSize(), color = Paper) {
+    var query by remember { mutableStateOf("") }
+    val style = LibraryStyle.fromId(state.libraryStyleId)
+    val filteredComics = remember(comics, query) {
+        if (query.isBlank()) comics else comics.filter { it.title.contains(query.trim(), ignoreCase = true) }
+    }
+    val recentlyRead = remember(comics) { comics.maxByOrNull { it.lastOpenedAt } }
+    Surface(modifier = Modifier.fillMaxSize(), color = style.background) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .safeDrawingPadding()
-                .padding(horizontal = 24.dp, vertical = 20.dp),
+                .padding(horizontal = 20.dp, vertical = 14.dp),
         ) {
-            Row(
+            LibraryHeader(
+                style = style,
+                isImporting = state.isImporting,
+                importEnabled = !state.isLoading && !state.isImporting,
+                onImport = onImport,
+                onOpenSettings = onOpenSettings,
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Image(
-                        painter = painterResource(R.drawable.estante_logo),
-                        contentDescription = null,
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.size(40.dp),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Column {
-                        Text(
-                            text = "ESTANTE",
-                            color = Olive,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 2.sp,
-                        )
-                        Text(
-                            text = "Sua próxima leitura.",
-                            color = Ink,
-                            fontSize = 25.sp,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-                }
-                Button(
-                    onClick = onImport,
-                    enabled = !state.isLoading && !state.isImporting,
-                    colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
-                ) {
-                    Text(if (state.isImporting) "Importando…" else "Adicionar")
-                }
-            }
+                singleLine = true,
+                placeholder = { Text("Buscar na estante", color = style.muted) },
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = style.ink),
+                shape = RoundedCornerShape(if (style.layout == LibraryLayout.COMICS) 8.dp else 16.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = style.surface,
+                    unfocusedContainerColor = style.surface,
+                    focusedIndicatorColor = style.accent,
+                    unfocusedIndicatorColor = style.shelf,
+                    focusedTextColor = style.ink,
+                    unfocusedTextColor = style.ink,
+                    cursorColor = style.accent,
+                ),
+            )
 
             state.error?.let { ErrorMessage(it) }
             if (state.isImporting) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(16.dp), color = Terracotta, strokeWidth = 2.dp)
-                    Text("  Preparando quadrinho…", color = Muted, fontSize = 13.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
+                    CircularProgressIndicator(Modifier.size(16.dp), color = style.accent, strokeWidth = 2.dp)
+                    Text("  Preparando arquivo…", color = style.muted, fontSize = 13.sp)
                 }
             }
             if (state.isLoading) {
-                CircularProgressIndicator(Modifier.align(Alignment.CenterHorizontally), color = Terracotta)
-            } else if (comics.isEmpty()) {
                 Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("Sua estante está vazia", color = Ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(Modifier.height(8.dp))
-                        Text("Adicione quadrinhos em PDF, CBZ ou CBR para começar.", color = Muted, textAlign = TextAlign.Center)
-                        Spacer(Modifier.height(16.dp))
-                        Button(onClick = onImport, colors = ButtonDefaults.buttonColors(containerColor = Terracotta)) { Text("Adicionar quadrinho") }
-                    }
+                    CircularProgressIndicator(color = style.accent)
+                }
+            } else if (comics.isEmpty()) {
+                EmptyLibrary(style = style, onImport = onImport, modifier = Modifier.weight(1f))
+            } else if (filteredComics.isEmpty()) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    Text("Nenhum livro encontrado", color = style.muted)
                 }
             } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 136.dp),
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    contentPadding = PaddingValues(vertical = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    items(comics, key = { it.id }) { comic ->
-                        Column(
-                            Modifier.clip(RoundedCornerShape(14.dp))
-                                .combinedClickable(
-                                    onClick = { onOpenComic(comic.id) },
-                                    onLongClick = { comicToDelete = comic },
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+                    val columnCount = (maxWidth / 148.dp).toInt().coerceIn(2, 6)
+                    val rows = filteredComics.chunked(columnCount)
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        if (query.isBlank() && recentlyRead != null) {
+                            item(key = "continue-reading") {
+                                ContinueReadingCard(
+                                    comic = recentlyRead,
+                                    style = style,
+                                    onClick = { onOpenComic(recentlyRead.id) },
                                 )
-                                .padding(6.dp),
-                        ) {
-                            Box(Modifier.fillMaxWidth().aspectRatio(0.68f).clip(RoundedCornerShape(12.dp)).background(Color(0xFFE8DFD0)), contentAlignment = Alignment.Center) {
-                                LibraryCover(comic.coverPath, comic.title)
                             }
-                            Spacer(Modifier.height(8.dp))
-                            Text(comic.title, color = Ink, maxLines = 2, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            if (comic.pageCount > 0) Text("${(comic.pageIndex + 1).coerceAtMost(comic.pageCount)} / ${comic.pageCount}", color = Muted, fontSize = 12.sp)
+                        }
+                        item(key = "library-heading") {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 2.dp),
+                                verticalAlignment = Alignment.Bottom,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column {
+                                    Text(
+                                        if (query.isBlank()) "Minha biblioteca" else "Resultados",
+                                        color = style.ink,
+                                        fontSize = 22.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default,
+                                    )
+                                    Text("${filteredComics.size} ${if (filteredComics.size == 1) "livro" else "livros e quadrinhos"}", color = style.muted, fontSize = 12.sp)
+                                }
+                                Text("CAPAS", color = style.accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp)
+                            }
+                        }
+                        items(rows, key = { row -> "row-${row.first().id}" }) { row ->
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    verticalAlignment = Alignment.Top,
+                                ) {
+                                    row.forEach { comic ->
+                                        LibraryBookCard(
+                                            comic = comic,
+                                            style = style,
+                                            modifier = Modifier.weight(1f),
+                                            onClick = { onOpenComic(comic.id) },
+                                            onLongClick = { comicToDelete = comic },
+                                        )
+                                    }
+                                    repeat(columnCount - row.size) { Spacer(Modifier.weight(1f)) }
+                                }
+                                if (style.layout == LibraryLayout.WOODEN_SHELVES) {
+                                    ShelfBoard(style = style)
+                                    Spacer(Modifier.height(4.dp))
+                                }
+                            }
                         }
                     }
                 }
@@ -318,7 +364,314 @@ private fun LibraryScreen(
 }
 
 @Composable
-private fun LibraryCover(path: String?, title: String) {
+private fun LibraryHeader(
+    style: LibraryStyle,
+    isImporting: Boolean,
+    importEnabled: Boolean,
+    onImport: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    val headerBackground = if (style == LibraryStyle.BLUE_EDITORIAL) Color(0xFF20364F) else style.background
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val compact = maxWidth < 430.dp
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(if (style.layout == LibraryLayout.COMICS) 10.dp else 20.dp))
+                .background(headerBackground)
+                .padding(horizontal = 4.dp, vertical = 3.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                Image(
+                    painter = painterResource(R.drawable.estante_logo),
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.size(38.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Column {
+                    Text("ESTANTE", color = if (style == LibraryStyle.BLUE_EDITORIAL) Color(0xFFD8C59B) else style.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+                    Text(
+                        "Um lugar para ler",
+                        color = if (style == LibraryStyle.BLUE_EDITORIAL) Color.White else style.ink,
+                        fontSize = if (compact) 16.sp else 20.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default,
+                        maxLines = 1,
+                    )
+                }
+            }
+            TextButton(
+                onClick = onOpenSettings,
+                contentPadding = PaddingValues(horizontal = if (compact) 8.dp else 12.dp, vertical = 6.dp),
+                modifier = Modifier.semantics { contentDescription = "Abrir configurações de aparência" },
+            ) {
+                Text("⚙", color = if (style == LibraryStyle.BLUE_EDITORIAL) Color.White else style.ink, fontSize = 18.sp)
+                if (!compact) Text("Aparência", color = if (style == LibraryStyle.BLUE_EDITORIAL) Color.White else style.ink, fontSize = 12.sp)
+            }
+            Button(
+                onClick = onImport,
+                enabled = importEnabled,
+                colors = ButtonDefaults.buttonColors(containerColor = style.accent, contentColor = Color.White),
+                contentPadding = PaddingValues(horizontal = if (compact) 10.dp else 14.dp, vertical = 10.dp),
+                modifier = Modifier.semantics { contentDescription = if (isImporting) "Importando arquivo" else "Adicionar livro ou quadrinho" },
+            ) {
+                Text(if (isImporting) "…" else if (compact) "+" else "+  Adicionar", maxLines = 1, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmptyLibrary(style: LibraryStyle, onImport: () -> Unit, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+            Text("▤", color = style.accent, fontSize = 48.sp)
+            Spacer(Modifier.height(10.dp))
+            Text("Sua estante está esperando", color = style.ink, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+            Spacer(Modifier.height(6.dp))
+            Text("Adicione livros ou quadrinhos em PDF, CBZ ou CBR para começar.", color = style.muted, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(18.dp))
+            Button(onClick = onImport, colors = ButtonDefaults.buttonColors(containerColor = style.accent)) { Text("Adicionar à estante") }
+        }
+    }
+}
+
+@Composable
+private fun ContinueReadingCard(comic: LibraryComicUi, style: LibraryStyle, onClick: () -> Unit) {
+    val progress = if (comic.pageCount > 0) (comic.pageIndex + 1).toFloat() / comic.pageCount else 0f
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(if (style.layout == LibraryLayout.COMICS) 10.dp else 20.dp),
+        color = style.surface,
+        shadowElevation = if (style == LibraryStyle.MINIMAL) 0.dp else 2.dp,
+        border = androidx.compose.foundation.BorderStroke(if (style.layout == LibraryLayout.COMICS) 2.dp else 1.dp, style.shelf.copy(alpha = 0.45f)),
+    ) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.width(if (style.layout == LibraryLayout.GALLERY) 84.dp else 62.dp)
+                    .aspectRatio(0.68f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(style.coverSurface),
+                contentAlignment = Alignment.Center,
+            ) { LibraryCover(comic.coverPath, comic.title, style) }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Text("CONTINUAR LENDO", color = style.accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.2.sp)
+                Spacer(Modifier.height(5.dp))
+                Text(comic.title, color = style.ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+                Spacer(Modifier.height(5.dp))
+                Text(if (comic.pageCount > 0) "Página ${(comic.pageIndex + 1).coerceAtMost(comic.pageCount)} de ${comic.pageCount}" else "Abrir leitura", color = style.muted, fontSize = 12.sp)
+                Spacer(Modifier.height(9.dp))
+                Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(4.dp)).background(style.shelf.copy(alpha = 0.35f))) {
+                    Box(Modifier.fillMaxWidth(progress.coerceIn(0.03f, 1f)).fillMaxHeight().background(style.accent))
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Text("›", color = style.accent, fontSize = 28.sp)
+        }
+    }
+}
+
+@Composable
+private fun LibraryBookCard(
+    comic: LibraryComicUi,
+    style: LibraryStyle,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+) {
+    val comicStyle = style.layout == LibraryLayout.COMICS
+    Column(
+        modifier
+            .clip(RoundedCornerShape(if (comicStyle) 8.dp else 14.dp))
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(if (style.layout == LibraryLayout.WOODEN_SHELVES) 2.dp else 5.dp),
+        horizontalAlignment = if (style.layout == LibraryLayout.WOODEN_SHELVES) Alignment.CenterHorizontally else Alignment.Start,
+    ) {
+        Box(
+            Modifier.fillMaxWidth()
+                .aspectRatio(0.68f)
+                .clip(RoundedCornerShape(if (comicStyle) 4.dp else 10.dp))
+                .background(style.coverSurface)
+                .then(if (comicStyle) Modifier.border(2.dp, style.ink, RoundedCornerShape(4.dp)) else Modifier),
+            contentAlignment = Alignment.Center,
+        ) {
+            LibraryCover(comic.coverPath, comic.title, style)
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            comic.title,
+            color = style.ink,
+            maxLines = 2,
+            fontSize = if (comicStyle) 13.sp else 12.sp,
+            lineHeight = 15.sp,
+            fontWeight = if (comicStyle) FontWeight.Bold else FontWeight.Medium,
+            textAlign = if (style.layout == LibraryLayout.WOODEN_SHELVES) TextAlign.Center else TextAlign.Start,
+            fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default,
+        )
+        if (comic.pageCount > 0 && style != LibraryStyle.MINIMAL) {
+            Text("${(comic.pageIndex + 1).coerceAtMost(comic.pageCount)} / ${comic.pageCount}", color = style.muted, fontSize = 10.sp)
+        }
+    }
+}
+
+@Composable
+private fun ShelfBoard(style: LibraryStyle) {
+    val boardColors = if (style == LibraryStyle.NIGHT_LIBRARY) {
+        listOf(Color(0xFF76573D), Color(0xFF4C3729), Color(0xFF38291F))
+    } else {
+        listOf(Color(0xFFD4AA76), Color(0xFFBC8953), Color(0xFF9B693C))
+    }
+    Box(
+        Modifier.fillMaxWidth().padding(top = 6.dp).height(9.dp)
+            .background(Brush.verticalGradient(boardColors), RoundedCornerShape(bottomStart = 4.dp, bottomEnd = 4.dp)),
+    )
+}
+
+@Composable
+private fun LibraryAppearanceScreen(
+    selectedStyleId: String,
+    onApplyStyle: (String) -> Unit,
+    onBack: () -> Unit,
+) {
+    var previewStyleId by remember(selectedStyleId) { mutableStateOf(selectedStyleId) }
+    val previewStyle = LibraryStyle.fromId(previewStyleId)
+    Surface(Modifier.fillMaxSize().safeDrawingPadding(), color = Color(0xFFF6F2EA)) {
+        Column(Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 14.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onBack) { Text("‹  Voltar", color = Ink) }
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text("CONFIGURAÇÕES", color = Olive, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+                    Text("Aparência da estante", color = Ink, fontSize = 23.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Serif)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            StylePreviewCard(style = previewStyle, isApplied = previewStyleId == selectedStyleId)
+            Spacer(Modifier.height(12.dp))
+            Text("Escolha um estilo", color = Ink, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 148.dp),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                items(LibraryStyle.entries, key = { it.id }) { style ->
+                    StyleChoiceCard(
+                        style = style,
+                        selected = previewStyleId == style.id,
+                        applied = selectedStyleId == style.id,
+                        onClick = { previewStyleId = style.id },
+                    )
+                }
+            }
+            Button(
+                onClick = { onApplyStyle(previewStyleId); onBack() },
+                enabled = previewStyleId != selectedStyleId,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = previewStyle.accent, disabledContainerColor = Color(0xFFD7D1C6)),
+            ) {
+                Text(if (previewStyleId == selectedStyleId) "Este estilo já está aplicado" else "Usar ${previewStyle.title}")
+            }
+        }
+    }
+}
+
+@Composable
+private fun StylePreviewCard(style: LibraryStyle, isApplied: Boolean) {
+    Surface(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = style.background,
+        shadowElevation = 2.dp,
+        border = androidx.compose.foundation.BorderStroke(1.dp, style.shelf.copy(alpha = 0.55f)),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text(style.title, color = style.ink, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+                    Text(if (isApplied) "Em uso" else style.description, color = style.muted, fontSize = 12.sp)
+                }
+                if (style == LibraryStyle.default) Text("PADRÃO", color = style.accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            }
+            Spacer(Modifier.height(10.dp))
+            StyleMiniature(style = style, modifier = Modifier.fillMaxWidth().height(70.dp))
+        }
+    }
+}
+
+@Composable
+private fun StyleChoiceCard(style: LibraryStyle, selected: Boolean, applied: Boolean, onClick: () -> Unit) {
+    val shape = RoundedCornerShape(if (style.layout == LibraryLayout.COMICS) 8.dp else 14.dp)
+    Surface(
+        modifier = Modifier.fillMaxWidth().semantics {
+            contentDescription = "${style.title}. ${style.description}. ${if (applied) "Estilo em uso." else if (selected) "Prévia selecionada." else "Toque para pré-visualizar."}"
+        }.clickable(role = Role.RadioButton, onClick = onClick),
+        shape = shape,
+        color = style.background,
+        border = androidx.compose.foundation.BorderStroke(if (selected) 2.dp else 1.dp, if (selected) style.accent else style.shelf.copy(alpha = 0.55f)),
+        shadowElevation = if (selected) 2.dp else 0.dp,
+    ) {
+        Column(Modifier.padding(9.dp)) {
+            StyleMiniature(style = style, modifier = Modifier.fillMaxWidth().height(58.dp))
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(style.title, color = style.ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+                Text(if (applied) "✓" else if (selected) "●" else "", color = style.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            }
+            if (style == LibraryStyle.default) Text("Padrão", color = style.muted, fontSize = 10.sp)
+        }
+    }
+}
+
+@Composable
+private fun StyleMiniature(style: LibraryStyle, modifier: Modifier = Modifier) {
+    Box(modifier.clip(RoundedCornerShape(8.dp)).background(style.surface)) {
+        if (style == LibraryStyle.BLUE_EDITORIAL) {
+            Box(Modifier.fillMaxWidth().fillMaxHeight(0.30f).background(Color(0xFF20364F)))
+        }
+        Column(Modifier.fillMaxSize().padding(horizontal = 6.dp, vertical = 4.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("ESTANTE", color = if (style == LibraryStyle.BLUE_EDITORIAL) Color.White else style.accent, fontSize = 6.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.7.sp)
+                Text("Minha biblioteca", color = style.ink, fontSize = 7.sp, fontWeight = FontWeight.SemiBold, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+                Text("•••", color = style.muted, fontSize = 6.sp)
+            }
+            Spacer(Modifier.height(3.dp))
+            Row(
+                Modifier.fillMaxWidth().weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(if (style.layout == LibraryLayout.GALLERY) 5.dp else 3.dp),
+                verticalAlignment = Alignment.Bottom,
+            ) {
+                listOf(Color(0xFF304E4B), Color(0xFFEEE4CF), Color(0xFF9D3D34), Color(0xFF26324B)).forEachIndexed { index, coverColor ->
+                    val featured = style.layout == LibraryLayout.GALLERY && index == 0
+                    Box(
+                        Modifier.weight(if (featured) 1.25f else 1f)
+                            .fillMaxHeight(if (featured) 0.98f else 0.82f)
+                            .clip(RoundedCornerShape(if (style.layout == LibraryLayout.COMICS) 2.dp else 3.dp))
+                            .background(coverColor)
+                            .then(if (style.layout == LibraryLayout.COMICS) Modifier.border(1.dp, style.ink) else Modifier),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (index == 1) Box(Modifier.fillMaxWidth(0.52f).fillMaxHeight(0.5f).background(Color(0xFFB89058), RoundedCornerShape(20.dp)))
+                    }
+                }
+            }
+            if (style.layout == LibraryLayout.WOODEN_SHELVES) {
+                Box(Modifier.fillMaxWidth().height(5.dp).background(style.shelf))
+            } else {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(style.shelf.copy(alpha = 0.65f)))
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryCover(path: String?, title: String, style: LibraryStyle) {
     val image by produceState<ImageBitmap?>(initialValue = null, key1 = path) {
         value = withContext(Dispatchers.IO) {
             path?.let { filePath ->
@@ -334,9 +687,13 @@ private fun LibraryCover(path: String?, title: String) {
         }?.asImageBitmap()
     }
     if (image != null) {
-        Image(image!!, contentDescription = "Capa de $title", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+        Image(image!!, contentDescription = "Capa de $title", modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
     } else {
-        Text("▤", color = Terracotta, fontSize = 40.sp)
+        Column(Modifier.fillMaxSize().padding(10.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Text(title.take(1).uppercase(), color = style.accent, fontSize = 30.sp, fontWeight = FontWeight.Bold, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+            Spacer(Modifier.height(5.dp))
+            Text(title, color = style.ink, fontSize = 10.sp, lineHeight = 12.sp, maxLines = 4, textAlign = TextAlign.Center, fontFamily = if (style.serif) FontFamily.Serif else FontFamily.Default)
+        }
     }
 }
 
@@ -616,10 +973,24 @@ private fun ComicReaderScreen(
                 )
                 OutlinedButton(
                     onClick = onToggleDirection,
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                    modifier = Modifier.padding(start = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                    modifier = Modifier.padding(start = 6.dp).semantics {
+                        contentDescription = if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
+                            "Direção da leitura: esquerda para direita. Toque para alternar."
+                        } else {
+                            "Direção da leitura: direita para esquerda. Toque para alternar."
+                        }
+                    },
                 ) {
-                    Text(if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) "LTR" else "RTL", fontSize = 11.sp)
+                    Text(
+                        text = if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
+                            "Esquerda → direita"
+                        } else {
+                            "Direita → esquerda"
+                        },
+                        fontSize = 11.sp,
+                        maxLines = 1,
+                    )
                 }
             }
 
@@ -806,7 +1177,6 @@ private fun ComicReaderScreen(
                         onClick = onNextRegion,
                         colors = ButtonDefaults.buttonColors(containerColor = Terracotta),
                     ) { Text("Próximo balão ›") }
-                    OutlinedButton(onClick = onRecognize, enabled = !state.isRecognizing) { Text("OCR") }
                     OutlinedButton(onClick = onToggleGuided) { Text("Página") }
                 }
             } else if (isAnalysisRunning) {

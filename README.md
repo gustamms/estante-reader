@@ -6,11 +6,11 @@ Biblioteca e leitor digital para quadrinhos, EPUBs e PDFs, com leitura guiada e 
 
 O MVP Android abre quadrinhos em PDF, CBZ e CBR e inicia a detecção local de balões automaticamente. Durante a leitura, uma lupa pequena amplia o balão ativo sobre a própria página; é possível tocar em outro balão ou avançar e voltar. A análise salva resultados por página para reutilizá-los quando o quadrinho for aberto novamente. OCR em português continua opcional.
 
-A estante mostra capas de vários títulos, guarda progresso por quadrinho e aceita importação CBZ/CBR. No leitor, a página abre limpa; tocar em um balão mostra a lupa e tocar no centro vazio revela os controles. A extração CBR é local e prepara as páginas em cache privado.
+A estante mostra capas de vários títulos, guarda progresso por quadrinho e aceita importação de PDF, CBZ e CBR. São dez estilos de aparência, com Madeira clara como padrão; a escolha fica salva nas configurações e a prévia pode ser examinada antes de aplicar. A biblioteca inclui busca, leitura recente e prateleiras adaptáveis. No leitor, a página abre limpa; tocar em um balão mostra a lupa e tocar no centro vazio revela os controles. A extração CBR é local e prepara as páginas em cache privado.
 
 O leitor também oferece página única, dupla ou automática, com capa separada, ordem LTR/RTL e exibição individual de páginas panorâmicas. O modo automático usa duas páginas em janelas largas e uma em janelas compactas.
 
-A detecção é experimental; qualidade e velocidade ainda precisam ser medidas em quadrinhos reais e no Galaxy Z Fold 6. A análise automática continua ligada ao leitor aberto, sem fila durável após encerrar o app. EPUB e PDF permanecem no roadmap.
+A detecção é experimental; qualidade e velocidade ainda precisam ser medidas em quadrinhos reais e no Galaxy Z Fold 6. A análise automática continua ligada ao leitor aberto, sem fila durável após encerrar o app. EPUB permanece no roadmap.
 
 ## Compilar
 

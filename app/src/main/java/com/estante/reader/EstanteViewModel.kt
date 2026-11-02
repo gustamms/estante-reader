@@ -60,6 +60,7 @@ private val ReadingDirectionPreference = stringPreferencesKey("reading_direction
 private val PageDisplayModePreference = stringPreferencesKey("page_display_mode")
 private val SeparateCoverPreference = booleanPreferencesKey("separate_cover")
 private val PanoramasAlonePreference = booleanPreferencesKey("panoramas_alone")
+private val LibraryStylePreference = stringPreferencesKey("library_style")
 
 private data class MaterializedArchive(val file: File, val fingerprint: String)
 
@@ -81,6 +82,7 @@ data class ReaderUiState(
     val pageDisplayMode: PageDisplayMode = PageDisplayMode.AUTOMATIC,
     val separateCover: Boolean = true,
     val panoramasAlone: Boolean = true,
+    val libraryStyleId: String = LibraryStyle.default.id,
     val bitmap: Bitmap? = null,
     val previousPageBitmap: Bitmap? = null,
     val nextPageBitmap: Bitmap? = null,
@@ -159,11 +161,13 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             val displayMode = preferences[PageDisplayModePreference]
                 ?.let { value -> runCatching { PageDisplayMode.valueOf(value) }.getOrNull() }
                 ?: PageDisplayMode.AUTOMATIC
+            val libraryStyle = LibraryStyle.fromId(preferences[LibraryStylePreference])
             _state.value = _state.value.copy(
                 readingDirection = direction,
                 pageDisplayMode = displayMode,
                 separateCover = preferences[SeparateCoverPreference] ?: true,
                 panoramasAlone = preferences[PanoramasAlonePreference] ?: true,
+                libraryStyleId = libraryStyle.id,
             )
             val savedUri = preferences[LastDocumentUri]?.let(Uri::parse) ?: return@launch
             val savedPage = preferences[LastPageIndex] ?: 0
@@ -362,6 +366,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                     pageCount = indexed.pageCount,
                     pageIndex = page,
                     lastReadPage = page,
+                    libraryStyleId = _state.value.libraryStyleId,
                     readingDirection = _state.value.readingDirection,
                     pageDisplayMode = comicDisplayMode,
                     separateCover = comicSeparateCover,
@@ -456,6 +461,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         _state.value = ReaderUiState(
             lastReadTitle = current.title ?: current.lastReadTitle,
             lastReadPage = current.pageIndex.takeIf { current.title != null } ?: current.lastReadPage,
+            libraryStyleId = current.libraryStyleId,
         )
     }
 
@@ -492,6 +498,16 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             getApplication<Application>().readerPreferences.edit {
                 it[PageDisplayModePreference] = mode.name
                 currentComicId?.let { id -> it[stringPreferencesKey("page_display_mode_$id")] = mode.name }
+            }
+        }
+    }
+
+    fun setLibraryStyle(styleId: String) {
+        val style = LibraryStyle.fromId(styleId)
+        _state.value = _state.value.copy(libraryStyleId = style.id)
+        viewModelScope.launch {
+            getApplication<Application>().readerPreferences.edit { preferences ->
+                preferences[LibraryStylePreference] = style.id
             }
         }
     }
