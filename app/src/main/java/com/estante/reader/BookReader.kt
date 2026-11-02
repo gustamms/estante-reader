@@ -263,9 +263,10 @@ internal fun BookReaderScreen(
         }
     }
 
-    DisposableEffect(webView.value) {
+    val currentWebView = webView.value
+    DisposableEffect(currentWebView) {
         onDispose {
-            webView.value?.apply {
+            currentWebView?.apply {
                 stopLoading()
                 removeJavascriptInterface("EstanteProgress")
                 removeJavascriptInterface("EstanteHighlights")
@@ -279,9 +280,9 @@ internal fun BookReaderScreen(
         webView.value?.applyReaderStyle(
             ReaderWebStyle(fontSizeSp, twoColumns, background, lineSpacing, marginsDp),
             chapterIndex,
-            highlights,
-            pendingHighlight,
-        ) { id -> onPendingHighlightConsumed(id) }
+            latestHighlights,
+            latestPendingHighlight,
+        ) { id -> latestOnPendingConsumed(id) }
     }
 
     LaunchedEffect(highlights, pendingHighlight, chapterIndex) {
