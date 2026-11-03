@@ -202,7 +202,9 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
                 onColumnsChange = viewModel::setBookColumnMode,
                 onBackgroundChange = viewModel::setReaderCanvasBackground,
                 onAddBookmark = viewModel::addBookBookmark,
-                onTextSelection = viewModel::addBookHighlight,
+                onTextSelection = { expectedBookId, href, text, start, end, prefix, suffix, onResult ->
+                    viewModel.addBookHighlight(expectedBookId, href, text, start, end, prefix, suffix, onResult)
+                },
                 onHighlightColorChange = viewModel::setBookHighlightColor,
                 onHighlightItemColorChange = viewModel::changeBookHighlightColor,
                 onOpenHighlight = viewModel::openBookHighlight,

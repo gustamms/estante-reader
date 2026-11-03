@@ -114,7 +114,7 @@ internal fun BookReaderScreen(
     onColumnsChange: (BookColumnMode) -> Unit,
     onBackgroundChange: (ReaderCanvasBackground) -> Unit,
     onAddBookmark: () -> Unit,
-    onTextSelection: (String, String, Int, Int, String, String) -> Unit,
+    onTextSelection: (String, String, String, Int, Int, String, String, (BookHighlightSaveResult) -> Unit) -> Unit,
     onHighlightColorChange: (String) -> Unit,
     onHighlightItemColorChange: (String, String) -> Unit,
     onOpenHighlight: (String) -> Unit,
@@ -203,7 +203,16 @@ internal fun BookReaderScreen(
         modifier = Modifier.fillMaxSize().background(background.color)
             .then(if (widePanelOpen) Modifier.padding(end = panelWidth) else Modifier),
         factory = { viewContext ->
-            ReaderWebView(viewContext).apply {
+                ReaderWebView(viewContext) { result -> coroutineScope.launch {
+                    val message = when (result) {
+                        BookHighlightSaveResult.SAVED -> "Trecho grifado"
+                        BookHighlightSaveResult.ALREADY_EXISTS -> "Este trecho já está grifado"
+                        BookHighlightSaveResult.INVALID_SELECTION -> "Não foi possível grifar esse trecho. Selecione o texto novamente."
+                        BookHighlightSaveResult.FAILED -> "Não foi possível salvar este grifo. Tente novamente."
+                    }
+                    snackbarHostState.showSnackbar(message)
+                } }.apply {
+                    val readerView = this
                 setBackgroundColor(background.color.toArgb())
                 settings.javaScriptEnabled = true
                 settings.useWideViewPort = true
@@ -233,8 +242,12 @@ internal fun BookReaderScreen(
                     turnInProgress = { pageTurn.turn != null },
                 ), "EstanteProgress")
                 addJavascriptInterface(BookSelectionBridge(
-                    reportSelection = { href, text, start, end, prefix, suffix ->
-                        post { latestOnTextSelection(href, text, start, end, prefix, suffix) }
+                    reportSelection = { requestId, href, text, start, end, prefix, suffix ->
+                        post {
+                            latestOnTextSelection(bookId, href, text, start, end, prefix, suffix) { result ->
+                                readerView.post { readerView.completeHighlightRequest(requestId, result) }
+                            }
+                        }
                     },
                     reportVisible = { id -> post { latestOnPendingConsumed(id) } },
                     removeHighlight = { id -> post {
@@ -251,13 +264,7 @@ internal fun BookReaderScreen(
                         val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
                         clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Trecho do livro", selected))
                     } },
-                    selectionHasHighlight = { hasHighlight -> post {
-                        selectionActionMode?.let { mode ->
-                            mode.menu.findItem(SELECTION_ACTION_REMOVE)?.isVisible = hasHighlight
-                            mode.menu.findItem(SELECTION_ACTION_COLORS)?.isVisible = hasHighlight
-                            mode.invalidate()
-                        }
-                    } },
+                    selectionHasHighlight = { hasHighlight -> post { readerView.setSelectionHasHighlight(hasHighlight) } },
                 ), "EstanteHighlights")
                 webViewClient = BookWebViewClient(
                     bookId = bookId,
@@ -660,7 +667,7 @@ private class BookProgressBridge(
 }
 
 private class BookSelectionBridge(
-    private val reportSelection: (String, String, Int, Int, String, String) -> Unit,
+    private val reportSelection: (String, String, String, Int, Int, String, String) -> Unit,
     private val reportVisible: (String) -> Unit,
     private val removeHighlight: (String) -> Unit,
     private val changeHighlightColor: (String, String) -> Unit,
@@ -669,6 +676,7 @@ private class BookSelectionBridge(
 ) {
     @JavascriptInterface
     fun onTextSelection(
+        requestId: String,
         chapterHref: String,
         selectedText: String,
         startOffset: Int,
@@ -676,8 +684,8 @@ private class BookSelectionBridge(
         prefix: String,
         suffix: String,
     ) {
-        if (selectedText.length in 2..5000 && startOffset >= 0 && endOffset > startOffset) {
-            reportSelection(chapterHref.take(2048), selectedText.take(5000), startOffset, endOffset, prefix.takeLast(80), suffix.take(80))
+        if (requestId.length <= 80) {
+            reportSelection(requestId, chapterHref.take(2048), selectedText.take(5001), startOffset, endOffset, prefix.takeLast(80), suffix.take(80))
         }
     }
 
@@ -701,9 +709,34 @@ private const val SELECTION_ACTION_REMOVE = 7104
 private const val SELECTION_ACTION_COLOR_BASE = 7110
 
 /** Wrap the ActionMode requested by WebView while preserving its selection lifecycle. */
-internal class ReaderWebView(context: android.content.Context) : WebView(context) {
+internal class ReaderWebView(
+    context: android.content.Context,
+    private val onHighlightResult: (BookHighlightSaveResult) -> Unit = {},
+) : WebView(context) {
     var selectionActionMode: android.view.ActionMode? = null
         private set
+    private var selectedTextHasHighlight = false
+    private var pendingHighlightRequestId: String? = null
+
+    fun setSelectionHasHighlight(hasHighlight: Boolean) {
+        selectedTextHasHighlight = hasHighlight
+        selectionActionMode?.invalidate()
+    }
+
+    fun completeHighlightRequest(requestId: String, result: BookHighlightSaveResult) {
+        if (pendingHighlightRequestId != requestId) return
+        pendingHighlightRequestId = null
+        val succeeded = result == BookHighlightSaveResult.SAVED || result == BookHighlightSaveResult.ALREADY_EXISTS
+        val jsResult = if (succeeded) "saved" else "failed"
+        evaluateJavascript(
+            "window.estanteHighlightResult?.(${org.json.JSONObject.quote(requestId)},${org.json.JSONObject.quote(jsResult)});",
+        ) {
+            val mode = selectionActionMode
+            mode?.menu?.findItem(SELECTION_ACTION_HIGHLIGHT)?.isEnabled = true
+            if (succeeded) mode?.finish() else mode?.invalidate()
+            onHighlightResult(result)
+        }
+    }
 
     override fun startActionMode(callback: android.view.ActionMode.Callback): android.view.ActionMode? =
         super.startActionMode(wrapSelectionActions(callback))
@@ -729,7 +762,22 @@ internal class ReaderWebView(context: android.content.Context) : WebView(context
             override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem): Boolean {
                 val action = when (item.itemId) {
                     SELECTION_ACTION_COPY -> "window.estanteCopySelection?.()"
-                    SELECTION_ACTION_HIGHLIGHT -> "window.estanteConfirmHighlight?.()"
+                    SELECTION_ACTION_HIGHLIGHT -> {
+                        if (pendingHighlightRequestId != null) return true
+                        val requestId = java.util.UUID.randomUUID().toString()
+                        pendingHighlightRequestId = requestId
+                        mode.menu.findItem(SELECTION_ACTION_HIGHLIGHT)?.isEnabled = false
+                        evaluateJavascript("window.estanteConfirmHighlight?.(${org.json.JSONObject.quote(requestId)})") { raw ->
+                            val status = runCatching { org.json.JSONTokener(raw).nextValue() as? String }.getOrNull()
+                            if (status != "pending" && pendingHighlightRequestId == requestId) {
+                                pendingHighlightRequestId = null
+                                mode.menu.findItem(SELECTION_ACTION_HIGHLIGHT)?.isEnabled = true
+                                mode.invalidate()
+                                onHighlightResult(BookHighlightSaveResult.INVALID_SELECTION)
+                            }
+                        }
+                        return true
+                    }
                     SELECTION_ACTION_REMOVE -> "window.estanteRemoveSelectedHighlight?.()"
                     in SELECTION_ACTION_COLOR_BASE until SELECTION_ACTION_COLOR_BASE + 4 ->
                         "window.estanteChangeSelectedHighlightColor?.(${org.json.JSONObject.quote(listOf("yellow", "green", "blue", "pink")[item.itemId - SELECTION_ACTION_COLOR_BASE])})"
@@ -754,14 +802,14 @@ internal class ReaderWebView(context: android.content.Context) : WebView(context
     private fun populateMenu(menu: android.view.Menu) {
         menu.clear()
         menu.add(android.view.Menu.NONE, SELECTION_ACTION_COPY, 0, "Copiar")
-        menu.add(android.view.Menu.NONE, SELECTION_ACTION_HIGHLIGHT, 1, "Grifar seleção")
+        menu.add(android.view.Menu.NONE, SELECTION_ACTION_HIGHLIGHT, 1, "Grifar seleção").isEnabled = pendingHighlightRequestId == null
         val colors = menu.addSubMenu(android.view.Menu.NONE, SELECTION_ACTION_COLORS, 2, "Mudar cor do grifo")
         listOf("Amarelo", "Verde", "Azul", "Rosa").forEachIndexed { index, label ->
             colors.add(android.view.Menu.NONE, SELECTION_ACTION_COLOR_BASE + index, index, label)
         }
         menu.add(android.view.Menu.NONE, SELECTION_ACTION_REMOVE, 3, "Remover grifo")
-        menu.findItem(SELECTION_ACTION_REMOVE).isVisible = false
-        menu.findItem(SELECTION_ACTION_COLORS).isVisible = false
+        menu.findItem(SELECTION_ACTION_REMOVE).isVisible = selectedTextHasHighlight
+        menu.findItem(SELECTION_ACTION_COLORS).isVisible = selectedTextHasHighlight
     }
 }
 
@@ -944,16 +992,17 @@ internal fun WebView.applyReaderStyle(
           // and normalizing while Android owns an active selection invalidates its handles.
           var items=JSON.parse($encodedHighlights);
           function textWalker(){return document.createTreeWalker(content,NodeFilter.SHOW_TEXT,{acceptNode:function(node){return node.parentElement&&node.parentElement.closest('script,style,noscript,template,[aria-hidden=true]')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT;}});}
+          function readFlatText(){var walker=textWalker(),all='',node;while((node=walker.nextNode()))all+=node.nodeValue;return all;}
           function offsetAt(containerNode,offset){
             var walker=textWalker(),cursor=0,node,boundary=document.createRange();
             boundary.setStart(containerNode,offset);boundary.collapse(true);
             while((node=walker.nextNode())){
               var part=document.createRange();part.selectNodeContents(node);
-              if(boundary.compareBoundaryPoints(Range.START_TO_START,part)<=0)break;
-              if(boundary.compareBoundaryPoints(Range.START_TO_END,part)>=0){cursor+=node.nodeValue.length;continue;}
-              if(node===containerNode)return cursor+offset;
+              if(node===containerNode)return cursor+Math.max(0,Math.min(node.nodeValue.length,offset));
+              if(boundary.compareBoundaryPoints(Range.START_TO_START,part)<=0)return cursor;
+              if(boundary.compareBoundaryPoints(Range.END_TO_END,part)>=0){cursor+=node.nodeValue.length;continue;}
               try{part.setEnd(containerNode,offset);cursor+=part.toString().length;}catch(e){}
-              break;
+              return cursor;
             }
             return cursor;
           }
@@ -979,7 +1028,7 @@ internal fun WebView.applyReaderStyle(
           function commonSuffix(a,b){var i=0;while(i<a.length&&i<b.length&&a[a.length-1-i]===b[b.length-1-i])i++;return i;}
           function commonPrefix(a,b){var i=0;while(i<a.length&&i<b.length&&a[i]===b[i])i++;return i;}
           function commonScore(flat,start,item){return commonSuffix(flat.slice(Math.max(0,start-item.prefix.length),start),item.prefix)+commonPrefix(flat.slice(start+item.text.length,start+item.text.length+item.suffix.length),item.suffix);}
-          var flatText=(function(){var walker=textWalker(),all='',node;while((node=walker.nextNode()))all+=node.nodeValue;return all;})();
+          var flatText=readFlatText();
           items.sort(function(a,b){return a.start-b.start;}).forEach(function(item){
             var range=locateItem(item,flatText);if(!range||range.collapsed)return;
             var span=document.createElement('span');span.className='estante-highlight';span.dataset.estanteHighlight=item.id;span.style.backgroundColor=item.color+'99';span.appendChild(range.extractContents());range.insertNode(span);
@@ -990,22 +1039,25 @@ internal fun WebView.applyReaderStyle(
           }
           function selectionHref(){var path=decodeURIComponent(location.pathname||'');var parts=path.split('/');return parts.length>3&&parts[1]==='book'?parts.slice(3).join('/'):'';}
           function selectedMark(range){var node=range.commonAncestorContainer;var el=node.nodeType===Node.ELEMENT_NODE?node:node.parentElement;var mark=el&&el.closest('[data-estante-highlight]');if(mark)return mark;var marks=content.querySelectorAll('[data-estante-highlight]');for(var i=0;i<marks.length;i++){try{if(range.intersectsNode(marks[i]))return marks[i];}catch(e){}}return null;}
-          window.estanteConfirmHighlight=function(){var s=window.estanteSelectionSnapshot,selection=getSelection();if(!s&&selection&&!selection.isCollapsed){var r=selection.getRangeAt(0),st=offsetAt(r.startContainer,r.startOffset),en=offsetAt(r.endContainer,r.endOffset);s={start:st,end:en,text:r.toString(),prefix:flatText.slice(Math.max(0,st-80),st),suffix:flatText.slice(en,en+80),href:selectionHref(),mark:selectedMark(r)?.dataset.estanteHighlight||null};}if(!s||s.mark||s.text.trim().length<2||s.text.length>5000)return;EstanteHighlights.onTextSelection(s.href,s.text,s.start,s.end,s.prefix,s.suffix);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();};
+          window.estantePendingHighlightRequests=window.estantePendingHighlightRequests||{};
+          window.estanteHighlightResult=function(requestId,result){var pending=window.estantePendingHighlightRequests[requestId];if(!pending)return 'stale';delete window.estantePendingHighlightRequests[requestId];if(result==='saved'){var selection=getSelection();if(selection&&selection.rangeCount===1&&pending.range){var current=selection.getRangeAt(0);if(current.compareBoundaryPoints(Range.START_TO_START,pending.range)===0&&current.compareBoundaryPoints(Range.END_TO_END,pending.range)===0)selection.removeAllRanges();}var snapshot=window.estanteSelectionSnapshot;if(snapshot&&snapshot.start===pending.start&&snapshot.end===pending.end&&snapshot.href===pending.href)window.estanteSelectionSnapshot=null;}return result;};
+          window.estanteConfirmHighlight=function(requestId){var selection=getSelection(),s=null,r=null;if(selection&&!selection.isCollapsed&&selection.rangeCount){r=selection.getRangeAt(0).cloneRange();var st=offsetAt(r.startContainer,r.startOffset),en=offsetAt(r.endContainer,r.endOffset),text=readFlatText().slice(st,en);s={start:st,end:en,text:text,prefix:readFlatText().slice(Math.max(0,st-80),st),suffix:readFlatText().slice(en,en+80),href:selectionHref(),mark:selectedMark(r)?.dataset.estanteHighlight||null,range:r};window.estanteSelectionSnapshot=s;}else{s=window.estanteSelectionSnapshot;r=s&&s.range;}
+            var flat=readFlatText();if(!requestId)requestId='direct-'+Date.now()+'-'+Math.random().toString(36).slice(2);if(!s||s.mark||s.text.trim().length<2||s.text.length>5000||s.end<=s.start||s.end>flat.length||flat.slice(s.start,s.end)!==s.text||typeof EstanteHighlights.onTextSelection!=='function')return 'invalid';
+            window.estantePendingHighlightRequests[requestId]={start:s.start,end:s.end,href:s.href,range:r?r.cloneRange():null};EstanteHighlights.onTextSelection(requestId,s.href,s.text,s.start,s.end,s.prefix,s.suffix);return 'pending';};
           window.estanteRemoveSelectedHighlight=function(){var s=window.estanteSelectionSnapshot,selection=getSelection(),mark=s&&s.mark;if(!mark&&selection&&selection.rangeCount){var found=selectedMark(selection.getRangeAt(0));mark=found&&found.dataset.estanteHighlight;}if(mark)EstanteHighlights.onRemoveHighlight(mark);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();return mark||'';};
           window.estanteChangeSelectedHighlightColor=function(color){var s=window.estanteSelectionSnapshot,selection=getSelection(),mark=s&&s.mark;if(!mark&&selection&&selection.rangeCount){var found=selectedMark(selection.getRangeAt(0));mark=found&&found.dataset.estanteHighlight;}if(mark)EstanteHighlights.onChangeHighlightColor(mark,color);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();return mark||'';};
           window.estanteCopySelection=function(){var selection=getSelection(),text=selection&&!selection.isCollapsed?String(selection):window.estanteSelectionSnapshot?.text;if(text)EstanteHighlights.onCopyText(text);};
           function reportSelection(){
-            var selection=window.getSelection();if(!selection||!selection.rangeCount)return;
+            var selection=window.getSelection();if(!selection||!selection.rangeCount){window.estanteSelectionSnapshot=null;EstanteHighlights.onSelectionHasHighlight(false);return;}
             var range=selection.getRangeAt(0);if(range.collapsed||!content.contains(range.commonAncestorContainer)){window.estanteSelectionSnapshot=null;EstanteHighlights.onSelectionHasHighlight(false);return;}
             var start=offsetAt(range.startContainer,range.startOffset);var end=offsetAt(range.endContainer,range.endOffset);
-            if(end<=start)return;
-            if(start<0||end<=start)return;
+            var text=readFlatText().slice(start,end);if(start<0||end<=start||text.trim().length<2||text.length>5000){window.estanteSelectionSnapshot=null;EstanteHighlights.onSelectionHasHighlight(false);return;}
             var mark=selectedMark(range),href=selectionHref();
-            window.estanteSelectionSnapshot={start:start,end:end,text:range.toString(),prefix:flatText.slice(Math.max(0,start-80),start),suffix:flatText.slice(end,end+80),href:href,mark:mark?mark.dataset.estanteHighlight:null};
+            var flat=readFlatText();window.estanteSelectionSnapshot={start:start,end:end,text:text,prefix:flat.slice(Math.max(0,start-80),start),suffix:flat.slice(end,end+80),href:href,mark:mark?mark.dataset.estanteHighlight:null,range:range.cloneRange()};
             EstanteHighlights.onSelectionHasHighlight(!!mark);
           }
-          function scheduleSelection(){clearTimeout(window.estanteSelectionTimer);window.estanteSelectionTimer=setTimeout(reportSelection,60);}
-          if(!window.estanteSelectionListener){document.addEventListener('selectionchange',scheduleSelection);window.estanteSelectionListener=true;}
+          window.estanteReportSelection=reportSelection;
+          if(!window.estanteSelectionListener){window.estanteSelectionListener=function(){var current=window.getSelection();if(!current||!current.rangeCount||current.isCollapsed){window.estanteSelectionSnapshot=null;EstanteHighlights.onSelectionHasHighlight(false);}clearTimeout(window.estanteSelectionTimer);window.estanteSelectionTimer=setTimeout(function(){window.estanteReportSelection&&window.estanteReportSelection();},60);};document.addEventListener('selectionchange',window.estanteSelectionListener);}
         })();
     """.trimIndent()
     evaluateJavascript(script, null)

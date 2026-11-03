@@ -1,7 +1,11 @@
 # Ajuste da seleção e dos grifos
 
 Data: 03/11/2026. Base examinada: `9caebbf` / `v0.1.0-alpha.10`.
-Status: ajuste principal implementado e validado no emulador. Falta a validação com o EPUB real e em aparelho físico.
+Status naquele momento: ajuste principal implementado e validado no emulador; faltavam o EPUB real e aparelho físico.
+
+Atualização de 03/11/2026, após a alpha.11: o diagnóstico de confirmação revelou posições incorretas e uma lacuna nos testes abaixo. Consulte o [plano de correção da confirmação de grifos](PLANO_CORRECAO_CONFIRMACAO_GRIFOS.md). Os resultados históricos deste documento não comprovam o fluxo completo de criação e persistência.
+
+Implementação da correção registrada em 03/11/2026 no [plano complementar](PLANO_CORRECAO_CONFIRMACAO_GRIFOS.md): offsets e confirmação aguardam resposta de gravação; o fluxo com o EPUB real, ViewModel, Room e DOM passou no emulador. A validação em aparelho físico segue pendente.
 
 ## Diagnóstico comprovado
 

@@ -18,6 +18,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.test.platform.app.InstrumentationRegistry
 import com.estante.reader.core.publication.EpubImporter
+import com.estante.reader.core.data.BookHighlightEntity
+import com.estante.reader.core.data.BookHighlightRepository
+import com.estante.reader.core.data.ComicDatabase
+import com.estante.reader.core.data.ComicEntity
+import com.estante.reader.core.data.ComicFormat
+import com.estante.reader.core.data.ComicImportState
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -25,6 +31,12 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+
+private typealias HighlightSaveCallback = (String, String, String, Int, Int, String, String, (BookHighlightSaveResult) -> Unit) -> Unit
 
 @OptIn(eu.wewox.pagecurl.ExperimentalPageCurlApi::class)
 class BookReaderRegressionAndroidTest {
@@ -198,7 +210,16 @@ class BookReaderRegressionAndroidTest {
     @Test fun suppliedEpubImportsAndRendersWithReadableTypography() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val source = File(context.filesDir, "reader-regression.epub")
-        assumeTrue("Optional local EPUB fixture must be staged in app files", source.isFile)
+        var copiedFixtureFromTestAssets = false
+        if (!source.isFile) {
+            copiedFixtureFromTestAssets = runCatching {
+                InstrumentationRegistry.getInstrumentation().context.assets.open("reader-regression.epub").use { input ->
+                    source.outputStream().use(input::copyTo)
+                }
+                true
+            }.getOrDefault(false)
+        }
+        assumeTrue("Optional EPUB fixture must be staged in app files or test assets", source.isFile)
         val root = File(context.cacheDir, "reader-regression-import")
         try {
             val book = EpubImporter().import(source, root, "Regression book")
@@ -208,14 +229,98 @@ class BookReaderRegressionAndroidTest {
                 file.length() > 8000 && org.jsoup.Jsoup.parse(file.readText()).select("p").any { it.text().length > 180 }
             }
             assertTrue(index >= 0)
+            val integrationBookId = "highlight-integration-${java.util.UUID.randomUUID()}"
+            val managedFile = File(context.filesDir, "library/test-fixtures/$integrationBookId.epub")
+            managedFile.parentFile?.mkdirs()
+            source.copyTo(managedFile, overwrite = true)
+            val database = ComicDatabase.getInstance(context)
+            val highlightRepository = BookHighlightRepository(database.bookHighlightDao())
+            runBlocking {
+                database.comicDao().upsert(
+                    ComicEntity(
+                        id = integrationBookId,
+                        contentHash = null,
+                        title = book.title,
+                        displayName = managedFile.name,
+                        format = ComicFormat.EPUB,
+                        managedPath = managedFile.absolutePath,
+                        sourceUri = null,
+                        pageCount = book.chapters.size,
+                        coverPageIndex = 0,
+                        coverPath = null,
+                        importState = ComicImportState.READY,
+                        importError = null,
+                        addedAt = System.currentTimeMillis(),
+                        lastOpenedAt = null,
+                        lastPageIndex = 0,
+                        lastRegionId = null,
+                        completed = false,
+                    ),
+                )
+            }
+            try {
             for (double in listOf(false, true)) {
                 ReaderHarness().use { h ->
-                    h.showPublication(book, index, if (double) 800 else 360, double)
+                    val viewModel = androidx.lifecycle.ViewModelProvider(h.activity)[EstanteViewModel::class.java]
+                    try {
+                        viewModel.openComic(integrationBookId)
+                        runBlocking {
+                            withTimeout(60_000) {
+                                viewModel.state.first {
+                                    it.publicationId == integrationBookId && it.publicationChapters.isNotEmpty() &&
+                                        (!double || it.publicationHighlights.isNotEmpty())
+                                }
+                            }
+                        }
+                    val saveResult = CompletableDeferred<BookHighlightSaveResult>()
+                    h.showPublication(
+                        book,
+                        index,
+                        if (double) 800 else 360,
+                        double,
+                        bookId = integrationBookId,
+                        readHighlights = { viewModel.state.value.publicationHighlights },
+                        onSaveSelection = { expectedBookId, href, text, start, end, prefix, suffix, result ->
+                            viewModel.addBookHighlight(expectedBookId, href, text, start, end, prefix, suffix) { saved ->
+                                saveResult.complete(saved)
+                                result(saved)
+                            }
+                        },
+                    )
                     val metrics = JSONObject(h.js("""(function(){var p=Array.from(document.querySelectorAll('p')).find(function(p){return p.textContent.length>180;});return {font:parseFloat(getComputedStyle(p).fontSize),line:parseFloat(getComputedStyle(p).lineHeight),pages:document.getElementById('estante-pages').scrollWidth/estantePageWidth,images:Array.from(document.images).every(function(i){return i.complete&&i.naturalWidth>0;})};})()"""))
                     assertEquals(28.0, metrics.getDouble("font"), 0.1)
                     assertEquals(28 * 1.72, metrics.getDouble("line"), 0.1)
                     assertTrue("Local images must load", metrics.getBoolean("images"))
                     assertTrue(metrics.getDouble("pages") > 1)
+                    val selected = JSONObject(org.json.JSONTokener(h.selectLongParagraphText(if (double) 30 else 0)).nextValue().toString())
+                    val staleBookResult = CompletableDeferred<BookHighlightSaveResult>()
+                    viewModel.addBookHighlight(
+                        "different-book",
+                        book.chapters[index].href,
+                        selected.getString("text"),
+                        0,
+                        selected.getString("text").length,
+                        "",
+                        "",
+                    ) { staleBookResult.complete(it) }
+                    assertEquals(BookHighlightSaveResult.INVALID_SELECTION, runBlocking { staleBookResult.await() })
+                    val beforeHighlight = h.savedSelections.size
+                    h.performHighlightAction()
+                    h.await("real EPUB selection reaches the reader callback") { h.savedSelections.size == beforeHighlight + 1 }
+                    val result = runBlocking { withTimeout(20_000) { saveResult.await() } }
+                    assertEquals(BookHighlightSaveResult.SAVED, result)
+                    val savedSelection = h.savedSelections.last()
+                    assertEquals(selected.getString("text"), savedSelection[1])
+                    assertEquals(selected.getString("text").length, (savedSelection[3] as Int) - (savedSelection[2] as Int))
+                    assertEquals("true", h.js("getSelection().isCollapsed"))
+                    val persisted = runBlocking {
+                        withTimeout(20_000) {
+                            highlightRepository.observeForBook(integrationBookId).first { it.size == (if (double) 2 else 1) }
+                        }
+                    }
+                    assertEquals(if (double) 2 else 1, persisted.size)
+                    assertEquals(selected.getString("text"), persisted.last().selectedText)
+                    h.awaitJs("Array.from(document.querySelectorAll('[data-estante-highlight]')).some(function(mark){return mark.textContent===${org.json.JSONObject.quote(selected.getString("text"))};})")
                     h.js("estanteRestoreProgress(0)")
                     h.screenshot("epub-${if (double) "double" else "single"}.png")
                     h.tapNext()
@@ -276,15 +381,28 @@ class BookReaderRegressionAndroidTest {
                     assertEquals("Cancelled chapter drag restores original chapter", nextPath, h.js("location.pathname"))
                     h.awaitJs("!EstanteProgress.isTurning()")
                     assertEquals(0.0, h.js("estanteProgressValue").toDouble(), .001)
+                    }
+                    finally { viewModel.closeDocument() }
                 }
             }
-        } finally { root.deleteRecursively() }
+            } finally {
+                val saved = runBlocking { highlightRepository.observeForBook(integrationBookId).first() }
+                saved.forEach { highlight -> runBlocking { highlightRepository.delete(highlight.id, integrationBookId) } }
+                runBlocking { database.comicDao().deleteById(integrationBookId) }
+                managedFile.delete()
+                File(context.filesDir, "library/publications/$integrationBookId").deleteRecursively()
+            }
+        } finally {
+            root.deleteRecursively()
+            if (copiedFixtureFromTestAssets) source.delete()
+        }
     }
 
     class ReaderHarness(private val curl: Boolean = false) : AutoCloseable {
         private val inst = InstrumentationRegistry.getInstrumentation()
-        private val activity = inst.startActivitySync(Intent(inst.targetContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) as MainActivity
+        internal val activity = inst.startActivitySync(Intent(inst.targetContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) as MainActivity
         internal val controller = BookPageTurnController()
+        internal val savedSelections = java.util.concurrent.CopyOnWriteArrayList<List<Any?>>()
         lateinit var view: WebView
         private var loaded = CountDownLatch(1)
         private var font = 24f
@@ -300,6 +418,7 @@ class BookReaderRegressionAndroidTest {
                 view = ReaderWebView(activity).apply {
                     settings.javaScriptEnabled = true
                     addJavascriptInterface(this@ReaderHarness, "EstanteProgress")
+                    addJavascriptInterface(SelectionBridge(), "EstanteHighlights")
                     if (curl) {
                         val gestures = BookDragTouchHandler(controller, { true }, { { _: Float -> } })
                         setOnTouchListener { _, event -> gestures.onTouch(this, event, true) }
@@ -335,27 +454,57 @@ class BookReaderRegressionAndroidTest {
         @JavascriptInterface fun onChapterBoundary(direction: Int) {
             view.post { view.loadDataWithBaseURL("https://reader.estante.local/book/test/next.html", SAMPLE.replace("Long paragraph", "Next chapter"), "text/html", "UTF-8", "https://reader.estante.local/book/test/next.html") }
         }
-        fun showPublication(book: com.estante.reader.core.publication.ImportedPublication, initialChapter: Int, width: Int, double: Boolean) {
+        private inner class SelectionBridge {
+            @JavascriptInterface fun onTextSelection(requestId: String, href: String, text: String, start: Int, end: Int, prefix: String, suffix: String) {
+                savedSelections.add(listOf(href, text, start, end, prefix, suffix))
+                view.post { (view as ReaderWebView).completeHighlightRequest(requestId, BookHighlightSaveResult.SAVED) }
+            }
+            @JavascriptInterface fun onHighlightVisible(id: String) {}
+            @JavascriptInterface fun onSelectionHasHighlight(hasHighlight: Boolean) { view.post { (view as ReaderWebView).setSelectionHasHighlight(hasHighlight) } }
+            @JavascriptInterface fun onRemoveHighlight(id: String) {}
+            @JavascriptInterface fun onChangeHighlightColor(id: String, color: String) {}
+            @JavascriptInterface fun onCopyText(text: String) {}
+        }
+        fun showPublication(
+            book: com.estante.reader.core.publication.ImportedPublication,
+            initialChapter: Int,
+            width: Int,
+            double: Boolean,
+            bookId: String = "regression",
+            readHighlights: () -> List<BookHighlightEntity> = { emptyList() },
+            onSaveSelection: HighlightSaveCallback? = null,
+        ) {
             var chapter by mutableStateOf(initialChapter)
             var progress by mutableStateOf(0f)
+            var displayedHighlights by mutableStateOf(readHighlights())
             inst.runOnMainSync {
                 (view.parent as? android.view.ViewGroup)?.removeView(view)
                 view.destroy()
                 activity.setContent {
                     Box(Modifier.width(width.dp).height(740.dp)) {
                         BookReaderScreen(
-                            title = book.title, author = book.author, bookId = "regression",
+                            title = book.title, author = book.author, bookId = bookId,
                             rootPath = book.root.path, chapters = book.chapters,
                             chapterIndex = chapter, progression = progress,
                             fontSizeSp = 28f, lineSpacing = 1.72f, marginsDp = 26f,
                             columnMode = if (double) com.estante.reader.core.publication.BookColumnMode.DOUBLE else com.estante.reader.core.publication.BookColumnMode.SINGLE,
                             background = ReaderCanvasBackground.PAPER, capabilities = book.capabilities,
-                            bookmarks = emptyList(), highlights = emptyList(), highlightColorId = "yellow",
+                            bookmarks = emptyList(), highlights = displayedHighlights, highlightColorId = "yellow",
                             pendingHighlight = null, searchResults = emptyList(), isSearching = false,
                             onClose = {}, onProgress = { c, p -> chapter = c; progress = p; publicationPosition = c to p },
                             onFontSizeChange = {}, onLineSpacingChange = {}, onMarginsChange = {},
                             onColumnsChange = {}, onBackgroundChange = {}, onAddBookmark = {},
-                            onTextSelection = { _, _, _, _, _, _ -> }, onHighlightColorChange = {},
+                            onTextSelection = { expectedBookId, href, text, start, end, prefix, suffix, result ->
+                                savedSelections.add(listOf(href, text, start, end, prefix, suffix))
+                                val finish: (BookHighlightSaveResult) -> Unit = { outcome ->
+                                    if (outcome == BookHighlightSaveResult.SAVED || outcome == BookHighlightSaveResult.ALREADY_EXISTS) {
+                                        displayedHighlights = readHighlights()
+                                    }
+                                    result(outcome)
+                                }
+                                if (onSaveSelection == null) finish(BookHighlightSaveResult.SAVED)
+                                else onSaveSelection.invoke(expectedBookId, href, text, start, end, prefix, suffix, finish)
+                            }, onHighlightColorChange = {},
                             onHighlightItemColorChange = { _, _ -> }, onOpenHighlight = {},
                             onRemoveHighlight = {}, onRestoreHighlight = {}, onPendingHighlightConsumed = {},
                             onSearch = {}, onOpenSearchResult = {},
@@ -401,6 +550,20 @@ class BookReaderRegressionAndroidTest {
             val done = CountDownLatch(1); var result = ""
             inst.runOnMainSync { view.evaluateJavascript(script) { result = it; done.countDown() } }
             assertTrue(done.await(10, TimeUnit.SECONDS)); return result
+        }
+        fun selectLongParagraphText(offset: Int): String = js("""(function(){var p=Array.from(document.querySelectorAll('p')).find(function(p){return p.textContent.trim().length>180;}),w=document.createTreeWalker(p,NodeFilter.SHOW_TEXT),nodes=[],n;while(n=w.nextNode())if(n.nodeValue.length)nodes.push(n);var skip=$offset,left=24,r=document.createRange(),startNode=null,startOffset=0,endNode=null,endOffset=0;for(var i=0;i<nodes.length&&left>0;i++){var node=nodes[i];if(!startNode&&skip>=node.nodeValue.length){skip-=node.nodeValue.length;continue;}var localStart=startNode?0:skip;if(!startNode){startNode=node;startOffset=localStart;skip=0;}var take=Math.min(left,node.nodeValue.length-localStart);endNode=node;endOffset=localStart+take;left-=take;}if(left)throw new Error('Fixture paragraph is too short');r.setStart(startNode,startOffset);r.setEnd(endNode,endOffset);getSelection().removeAllRanges();getSelection().addRange(r);return JSON.stringify({text:r.toString()});})()""")
+        fun performHighlightAction() {
+            inst.runOnMainSync {
+                val callback = object : android.view.ActionMode.Callback {
+                    override fun onCreateActionMode(mode: android.view.ActionMode, menu: android.view.Menu) = true
+                    override fun onPrepareActionMode(mode: android.view.ActionMode, menu: android.view.Menu) = true
+                    override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem) = false
+                    override fun onDestroyActionMode(mode: android.view.ActionMode) {}
+                }
+                val mode = (view as ReaderWebView).startActionMode(callback)
+                    ?: throw AssertionError("Reader selection menu must start")
+                check(mode.menu.performIdentifierAction(7102, 0)) { "Grifar seleção action must be handled" }
+            }
         }
         fun awaitJs(expression: String) {
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)

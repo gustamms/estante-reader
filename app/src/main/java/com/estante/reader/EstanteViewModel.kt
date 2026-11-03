@@ -91,6 +91,8 @@ private const val MIN_HIGHLIGHT_TEXT_LENGTH = 2
 private const val MAX_HIGHLIGHT_TEXT_LENGTH = 5000
 private const val HIGHLIGHT_CONTEXT_LENGTH = 80
 
+enum class BookHighlightSaveResult { SAVED, ALREADY_EXISTS, INVALID_SELECTION, FAILED }
+
 private data class MaterializedArchive(val file: File, val fingerprint: String)
 
 data class ReaderSpreadImages(
@@ -927,24 +929,37 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
 
     /** Persists the stable text range after the reader's explicit Grifar action. */
     fun addBookHighlight(
+        expectedBookId: String,
         chapterHref: String,
         selectedText: String,
         startOffset: Int,
         endOffset: Int,
         prefix: String,
         suffix: String,
+        onResult: (BookHighlightSaveResult) -> Unit = {},
     ) {
         val current = _state.value
-        val bookId = current.publicationId ?: return
+        val bookId = current.publicationId
+        if (bookId == null || bookId != expectedBookId) {
+            onResult(BookHighlightSaveResult.INVALID_SELECTION)
+            return
+        }
         val chapterIndex = current.publicationChapters.indexOfFirst { it.href == chapterHref }
-        val quote = selectedText.take(MAX_HIGHLIGHT_TEXT_LENGTH)
+        val quote = selectedText
         if (chapterIndex < 0 || quote.trim().length < MIN_HIGHLIGHT_TEXT_LENGTH ||
-            startOffset < 0 || endOffset <= startOffset || endOffset - startOffset != quote.length
-        ) return
+            quote.length > MAX_HIGHLIGHT_TEXT_LENGTH || startOffset < 0 || endOffset <= startOffset ||
+            endOffset - startOffset != quote.length
+        ) {
+            onResult(BookHighlightSaveResult.INVALID_SELECTION)
+            return
+        }
         if (current.publicationHighlights.any {
                 it.chapterHref == chapterHref && it.startOffset == startOffset && it.endOffset == endOffset
             }
-        ) return
+        ) {
+            onResult(BookHighlightSaveResult.ALREADY_EXISTS)
+            return
+        }
 
         val highlight = BookHighlightEntity(
             id = UUID.randomUUID().toString(),
@@ -959,24 +974,23 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             colorId = BookHighlightColor.fromId(current.bookHighlightColorId).id,
             createdAt = System.currentTimeMillis(),
         )
-        _state.value = current.copy(
-            publicationHighlights = (current.publicationHighlights + highlight)
-                .sortedWith(compareBy<BookHighlightEntity> { it.chapterIndex }.thenBy { it.startOffset }),
-        )
         viewModelScope.launch {
-            runCatching {
+            val saveResult = runCatching {
                 bookHighlightMutationMutex.withLock {
                     withContext(Dispatchers.IO) { bookHighlightRepository.insert(highlight) }
                 }
+            }.fold(
+                onSuccess = { BookHighlightSaveResult.SAVED },
+                onFailure = { BookHighlightSaveResult.FAILED }
+            )
+            if (saveResult == BookHighlightSaveResult.SAVED && _state.value.publicationId == bookId) {
+                _state.value = _state.value.copy(
+                    publicationHighlights = (_state.value.publicationHighlights + highlight)
+                        .distinctBy { it.id }
+                        .sortedWith(compareBy<BookHighlightEntity> { it.chapterIndex }.thenBy { it.startOffset }),
+                )
             }
-                .onFailure {
-                    if (_state.value.publicationId == bookId) {
-                        _state.value = _state.value.copy(
-                            publicationHighlights = _state.value.publicationHighlights.filterNot { it.id == highlight.id },
-                            error = "Não foi possível salvar este grifo.",
-                        )
-                    }
-                }
+            onResult(saveResult)
         }
     }
 
