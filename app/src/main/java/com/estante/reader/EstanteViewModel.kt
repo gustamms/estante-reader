@@ -925,7 +925,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /** Saves the browser's final text selection without interrupting the selection gesture. */
+    /** Persists the stable text range after the reader's explicit Grifar action. */
     fun addBookHighlight(
         chapterHref: String,
         selectedText: String,
@@ -937,9 +937,9 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         val current = _state.value
         val bookId = current.publicationId ?: return
         val chapterIndex = current.publicationChapters.indexOfFirst { it.href == chapterHref }
-        val quote = selectedText.trim().take(MAX_HIGHLIGHT_TEXT_LENGTH)
-        if (chapterIndex < 0 || quote.length < MIN_HIGHLIGHT_TEXT_LENGTH ||
-            startOffset < 0 || endOffset <= startOffset || endOffset - startOffset > MAX_HIGHLIGHT_TEXT_LENGTH + 64
+        val quote = selectedText.take(MAX_HIGHLIGHT_TEXT_LENGTH)
+        if (chapterIndex < 0 || quote.trim().length < MIN_HIGHLIGHT_TEXT_LENGTH ||
+            startOffset < 0 || endOffset <= startOffset || endOffset - startOffset != quote.length
         ) return
         if (current.publicationHighlights.any {
                 it.chapterHref == chapterHref && it.startOffset == startOffset && it.endOffset == endOffset
@@ -1002,13 +1002,14 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             if (it.id == highlightId) it.copy(colorId = color.id) else it
         })
         viewModelScope.launch {
-            val updated = withContext(Dispatchers.IO) {
-                bookHighlightMutationMutex.withLock { bookHighlightRepository.updateColor(highlightId, bookId, color.id) }
-            }
-            if (updated == 0 && _state.value.publicationId == bookId) {
-                _state.value = _state.value.copy(publicationHighlights = _state.value.publicationHighlights.map {
-                    if (it.id == highlightId) previous else it
-                })
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    bookHighlightMutationMutex.withLock { bookHighlightRepository.updateColor(highlightId, bookId, color.id) }
+                }
+            }.onSuccess { updated ->
+                if (updated == 0) restoreHighlightState(bookId, previous, "Não foi possível alterar a cor deste grifo.")
+            }.onFailure {
+                restoreHighlightState(bookId, previous, "Não foi possível alterar a cor deste grifo.")
             }
         }
     }
@@ -1016,11 +1017,17 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     fun removeBookHighlight(highlightId: String) {
         val current = _state.value
         val bookId = current.publicationId ?: return
-        if (current.publicationHighlights.none { it.id == highlightId }) return
+        val removed = current.publicationHighlights.firstOrNull { it.id == highlightId } ?: return
         _state.value = current.copy(publicationHighlights = current.publicationHighlights.filterNot { it.id == highlightId })
         viewModelScope.launch {
-            bookHighlightMutationMutex.withLock {
-                withContext(Dispatchers.IO) { bookHighlightRepository.delete(highlightId, bookId) }
+            runCatching {
+                bookHighlightMutationMutex.withLock {
+                    withContext(Dispatchers.IO) { bookHighlightRepository.delete(highlightId, bookId) }
+                }
+            }.onSuccess { deleted ->
+                if (deleted == 0) restoreHighlightState(bookId, removed, "Não foi possível remover este grifo.")
+            }.onFailure {
+                restoreHighlightState(bookId, removed, "Não foi possível remover este grifo.")
             }
         }
     }
@@ -1037,8 +1044,25 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 bookHighlightMutationMutex.withLock {
                     withContext(Dispatchers.IO) { bookHighlightRepository.insert(highlight) }
                 }
+            }.onFailure {
+                if (_state.value.publicationId == highlight.bookId) {
+                    _state.value = _state.value.copy(
+                        publicationHighlights = _state.value.publicationHighlights.filterNot { it.id == highlight.id },
+                        error = "Não foi possível restaurar este grifo.",
+                    )
+                }
             }
         }
+    }
+
+    private fun restoreHighlightState(bookId: String, highlight: BookHighlightEntity, error: String) {
+        if (_state.value.publicationId != bookId) return
+        _state.value = _state.value.copy(
+            publicationHighlights = (_state.value.publicationHighlights + highlight)
+                .distinctBy { it.id }
+                .sortedWith(compareBy<BookHighlightEntity> { it.chapterIndex }.thenBy { it.startOffset }),
+            error = error,
+        )
     }
 
     fun openBookHighlight(highlightId: String) {

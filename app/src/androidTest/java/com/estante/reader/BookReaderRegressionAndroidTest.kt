@@ -297,7 +297,7 @@ class BookReaderRegressionAndroidTest {
         }
         init {
             inst.runOnMainSync {
-                view = WebView(activity).apply {
+                view = ReaderWebView(activity).apply {
                     settings.javaScriptEnabled = true
                     addJavascriptInterface(this@ReaderHarness, "EstanteProgress")
                     if (curl) {

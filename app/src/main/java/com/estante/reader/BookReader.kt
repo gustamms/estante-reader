@@ -160,6 +160,9 @@ internal fun BookReaderScreen(
     val latestHighlights by rememberUpdatedState(highlights)
     val latestPendingHighlight by rememberUpdatedState(pendingHighlight)
     val latestOnTextSelection by rememberUpdatedState(onTextSelection)
+    val latestOnRemoveHighlight by rememberUpdatedState(onRemoveHighlight)
+    val latestOnHighlightItemColorChange by rememberUpdatedState(onHighlightItemColorChange)
+    val latestOnRestoreHighlight by rememberUpdatedState(onRestoreHighlight)
     val latestOnPendingConsumed by rememberUpdatedState(onPendingHighlightConsumed)
     val webView = remember(bookId) { mutableStateOf<WebView?>(null) }
     val pageTurn = remember(bookId) { BookPageTurnController() }
@@ -200,7 +203,7 @@ internal fun BookReaderScreen(
         modifier = Modifier.fillMaxSize().background(background.color)
             .then(if (widePanelOpen) Modifier.padding(end = panelWidth) else Modifier),
         factory = { viewContext ->
-            WebView(viewContext).apply {
+            ReaderWebView(viewContext).apply {
                 setBackgroundColor(background.color.toArgb())
                 settings.javaScriptEnabled = true
                 settings.useWideViewPort = true
@@ -231,10 +234,30 @@ internal fun BookReaderScreen(
                 ), "EstanteProgress")
                 addJavascriptInterface(BookSelectionBridge(
                     reportSelection = { href, text, start, end, prefix, suffix ->
-                        latestOnTextSelection(href, text, start, end, prefix, suffix)
-                        coroutineScope.launch { snackbarHostState.showSnackbar("Trecho grifado neste livro") }
+                        post { latestOnTextSelection(href, text, start, end, prefix, suffix) }
                     },
-                    reportVisible = { id -> latestOnPendingConsumed(id) },
+                    reportVisible = { id -> post { latestOnPendingConsumed(id) } },
+                    removeHighlight = { id -> post {
+                        val removed = latestHighlights.firstOrNull { it.id == id } ?: return@post
+                        latestOnRemoveHighlight(id)
+                        coroutineScope.launch {
+                            if (snackbarHostState.showSnackbar("Grifo removido", "Desfazer") == androidx.compose.material3.SnackbarResult.ActionPerformed) {
+                                latestOnRestoreHighlight(removed)
+                            }
+                        }
+                    } },
+                    changeHighlightColor = { id, color -> post { latestOnHighlightItemColorChange(id, color) } },
+                    copyText = { selected -> post {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Trecho do livro", selected))
+                    } },
+                    selectionHasHighlight = { hasHighlight -> post {
+                        selectionActionMode?.let { mode ->
+                            mode.menu.findItem(SELECTION_ACTION_REMOVE)?.isVisible = hasHighlight
+                            mode.menu.findItem(SELECTION_ACTION_COLORS)?.isVisible = hasHighlight
+                            mode.invalidate()
+                        }
+                    } },
                 ), "EstanteHighlights")
                 webViewClient = BookWebViewClient(
                     bookId = bookId,
@@ -639,6 +662,10 @@ private class BookProgressBridge(
 private class BookSelectionBridge(
     private val reportSelection: (String, String, Int, Int, String, String) -> Unit,
     private val reportVisible: (String) -> Unit,
+    private val removeHighlight: (String) -> Unit,
+    private val changeHighlightColor: (String, String) -> Unit,
+    private val copyText: (String) -> Unit,
+    private val selectionHasHighlight: (Boolean) -> Unit,
 ) {
     @JavascriptInterface
     fun onTextSelection(
@@ -657,6 +684,84 @@ private class BookSelectionBridge(
     @JavascriptInterface
     fun onHighlightVisible(id: String) {
         if (id.length <= 64) reportVisible(id)
+    }
+
+    @JavascriptInterface fun onRemoveHighlight(id: String) { if (id.length <= 64) removeHighlight(id) }
+    @JavascriptInterface fun onChangeHighlightColor(id: String, color: String) {
+        if (id.length <= 64 && color in setOf("yellow", "green", "blue", "pink")) changeHighlightColor(id, color)
+    }
+    @JavascriptInterface fun onCopyText(text: String) { if (text.length <= 5000) copyText(text) }
+    @JavascriptInterface fun onSelectionHasHighlight(hasHighlight: Boolean) { selectionHasHighlight(hasHighlight) }
+}
+
+private const val SELECTION_ACTION_COPY = 7101
+private const val SELECTION_ACTION_HIGHLIGHT = 7102
+private const val SELECTION_ACTION_COLORS = 7103
+private const val SELECTION_ACTION_REMOVE = 7104
+private const val SELECTION_ACTION_COLOR_BASE = 7110
+
+/** Wrap the ActionMode requested by WebView while preserving its selection lifecycle. */
+internal class ReaderWebView(context: android.content.Context) : WebView(context) {
+    var selectionActionMode: android.view.ActionMode? = null
+        private set
+
+    override fun startActionMode(callback: android.view.ActionMode.Callback): android.view.ActionMode? =
+        super.startActionMode(wrapSelectionActions(callback))
+
+    override fun startActionMode(callback: android.view.ActionMode.Callback, type: Int): android.view.ActionMode? =
+        super.startActionMode(wrapSelectionActions(callback), type)
+
+    private fun wrapSelectionActions(original: android.view.ActionMode.Callback): android.view.ActionMode.Callback =
+        object : android.view.ActionMode.Callback2() {
+            override fun onCreateActionMode(mode: android.view.ActionMode, menu: android.view.Menu): Boolean {
+                if (!original.onCreateActionMode(mode, menu)) return false
+                selectionActionMode = mode
+                populateMenu(menu)
+                return true
+            }
+
+            override fun onPrepareActionMode(mode: android.view.ActionMode, menu: android.view.Menu): Boolean {
+                original.onPrepareActionMode(mode, menu)
+                populateMenu(menu)
+                return true
+            }
+
+            override fun onActionItemClicked(mode: android.view.ActionMode, item: android.view.MenuItem): Boolean {
+                val action = when (item.itemId) {
+                    SELECTION_ACTION_COPY -> "window.estanteCopySelection?.()"
+                    SELECTION_ACTION_HIGHLIGHT -> "window.estanteConfirmHighlight?.()"
+                    SELECTION_ACTION_REMOVE -> "window.estanteRemoveSelectedHighlight?.()"
+                    in SELECTION_ACTION_COLOR_BASE until SELECTION_ACTION_COLOR_BASE + 4 ->
+                        "window.estanteChangeSelectedHighlightColor?.(${org.json.JSONObject.quote(listOf("yellow", "green", "blue", "pink")[item.itemId - SELECTION_ACTION_COLOR_BASE])})"
+                    else -> return original.onActionItemClicked(mode, item)
+                }
+                evaluateJavascript(action, null)
+                mode.finish()
+                return true
+            }
+
+            override fun onDestroyActionMode(mode: android.view.ActionMode) {
+                if (selectionActionMode === mode) selectionActionMode = null
+                original.onDestroyActionMode(mode)
+            }
+
+            override fun onGetContentRect(mode: android.view.ActionMode, view: android.view.View, outRect: android.graphics.Rect) {
+                if (original is android.view.ActionMode.Callback2) original.onGetContentRect(mode, view, outRect)
+                else outRect.set(0, 0, view.width, view.height)
+            }
+        }
+
+    private fun populateMenu(menu: android.view.Menu) {
+        menu.clear()
+        menu.add(android.view.Menu.NONE, SELECTION_ACTION_COPY, 0, "Copiar")
+        menu.add(android.view.Menu.NONE, SELECTION_ACTION_HIGHLIGHT, 1, "Grifar seleção")
+        val colors = menu.addSubMenu(android.view.Menu.NONE, SELECTION_ACTION_COLORS, 2, "Mudar cor do grifo")
+        listOf("Amarelo", "Verde", "Azul", "Rosa").forEachIndexed { index, label ->
+            colors.add(android.view.Menu.NONE, SELECTION_ACTION_COLOR_BASE + index, index, label)
+        }
+        menu.add(android.view.Menu.NONE, SELECTION_ACTION_REMOVE, 3, "Remover grifo")
+        menu.findItem(SELECTION_ACTION_REMOVE).isVisible = false
+        menu.findItem(SELECTION_ACTION_COLORS).isVisible = false
     }
 }
 
@@ -835,17 +940,48 @@ internal fun WebView.applyReaderStyle(
           if(hadLayout&&previousProgress!=null&&$target===null)requestAnimationFrame(function(){window.estanteRestoreProgress(previousProgress);});
           requestAnimationFrame(function(){EstanteProgress.onPagination(Math.round(pager.scrollLeft/window.estantePageWidth)+1,pageCount());});
           document.querySelectorAll('[data-estante-highlight]').forEach(function(mark){var parent=mark.parentNode;if(!parent)return;while(mark.firstChild)parent.insertBefore(mark.firstChild,mark);parent.removeChild(mark);});
-          if(document.body)document.body.normalize();
+          // Do not normalize adjacent text nodes: selection offsets are based on this order,
+          // and normalizing while Android owns an active selection invalidates its handles.
           var items=JSON.parse($encodedHighlights);
+          function textWalker(){return document.createTreeWalker(content,NodeFilter.SHOW_TEXT,{acceptNode:function(node){return node.parentElement&&node.parentElement.closest('script,style,noscript,template,[aria-hidden=true]')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT;}});}
+          function offsetAt(containerNode,offset){
+            var walker=textWalker(),cursor=0,node,boundary=document.createRange();
+            boundary.setStart(containerNode,offset);boundary.collapse(true);
+            while((node=walker.nextNode())){
+              var part=document.createRange();part.selectNodeContents(node);
+              if(boundary.compareBoundaryPoints(Range.START_TO_START,part)<=0)break;
+              if(boundary.compareBoundaryPoints(Range.START_TO_END,part)>=0){cursor+=node.nodeValue.length;continue;}
+              if(node===containerNode)return cursor+offset;
+              try{part.setEnd(containerNode,offset);cursor+=part.toString().length;}catch(e){}
+              break;
+            }
+            return cursor;
+          }
           function rangeFor(start,end){
-            var walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT,{acceptNode:function(node){return node.parentElement&&node.parentElement.closest('script,style,noscript,template')?NodeFilter.FILTER_REJECT:NodeFilter.FILTER_ACCEPT;}});
+            var walker=textWalker();
             var cursor=0,startNode=null,endNode=null,startLocal=0,endLocal=0,node;
             while((node=walker.nextNode())){var length=node.nodeValue.length;if(!startNode&&start>=cursor&&start<cursor+length){startNode=node;startLocal=start-cursor;}if(!endNode&&end>cursor&&end<=cursor+length){endNode=node;endLocal=end-cursor;}cursor+=length;if(startNode&&endNode)break;}
             if(!startNode||!endNode)return null;
             var range=document.createRange();range.setStart(startNode,startLocal);range.setEnd(endNode,endLocal);return range;
           }
+          function locateItem(item,flat){
+            var start=item.start,end=item.end;
+            if(flat.slice(start,end)!==item.text){
+              var matches=[],from=0;
+              while((from=flat.indexOf(item.text,from))!==-1){matches.push(from++);}
+              if(!matches.length)return null;
+              matches.sort(function(a,b){var score=function(pos){var before=flat.slice(Math.max(0,pos-item.prefix.length),pos),after=flat.slice(pos+item.text.length,pos+item.text.length+item.suffix.length);return commonSuffix(before,item.prefix)+commonPrefix(after,item.suffix);};return score(b)-score(a);});
+              if(matches.length>1&&commonScore(flat,matches[0],item)<=commonScore(flat,matches[1],item))return null;
+              start=matches[0];end=start+item.text.length;
+            }
+            return rangeFor(start,end);
+          }
+          function commonSuffix(a,b){var i=0;while(i<a.length&&i<b.length&&a[a.length-1-i]===b[b.length-1-i])i++;return i;}
+          function commonPrefix(a,b){var i=0;while(i<a.length&&i<b.length&&a[i]===b[i])i++;return i;}
+          function commonScore(flat,start,item){return commonSuffix(flat.slice(Math.max(0,start-item.prefix.length),start),item.prefix)+commonPrefix(flat.slice(start+item.text.length,start+item.text.length+item.suffix.length),item.suffix);}
+          var flatText=(function(){var walker=textWalker(),all='',node;while((node=walker.nextNode()))all+=node.nodeValue;return all;})();
           items.sort(function(a,b){return a.start-b.start;}).forEach(function(item){
-            var range=rangeFor(item.start,item.end);if(!range||range.collapsed)return;
+            var range=locateItem(item,flatText);if(!range||range.collapsed)return;
             var span=document.createElement('span');span.className='estante-highlight';span.dataset.estanteHighlight=item.id;span.style.backgroundColor=item.color+'99';span.appendChild(range.extractContents());range.insertNode(span);
           });
           if($target){
@@ -853,22 +989,23 @@ internal fun WebView.applyReaderStyle(
             if(focused){focused.classList.add('estante-highlight-focus');focused.scrollIntoView({block:'nearest',inline:'start'});pager.scrollTo({left:Math.floor(pager.scrollLeft/window.estantePageWidth)*window.estantePageWidth,top:0});reportPage();setTimeout(function(){focused.classList.remove('estante-highlight-focus');},1500);EstanteHighlights.onHighlightVisible($target);}
           }
           function selectionHref(){var path=decodeURIComponent(location.pathname||'');var parts=path.split('/');return parts.length>3&&parts[1]==='book'?parts.slice(3).join('/'):'';}
-          function offsetAt(container,offset){var range=document.createRange();range.selectNodeContents(document.body);range.setEnd(container,offset);return range.toString().length;}
+          function selectedMark(range){var node=range.commonAncestorContainer;var el=node.nodeType===Node.ELEMENT_NODE?node:node.parentElement;var mark=el&&el.closest('[data-estante-highlight]');if(mark)return mark;var marks=content.querySelectorAll('[data-estante-highlight]');for(var i=0;i<marks.length;i++){try{if(range.intersectsNode(marks[i]))return marks[i];}catch(e){}}return null;}
+          window.estanteConfirmHighlight=function(){var s=window.estanteSelectionSnapshot,selection=getSelection();if(!s&&selection&&!selection.isCollapsed){var r=selection.getRangeAt(0),st=offsetAt(r.startContainer,r.startOffset),en=offsetAt(r.endContainer,r.endOffset);s={start:st,end:en,text:r.toString(),prefix:flatText.slice(Math.max(0,st-80),st),suffix:flatText.slice(en,en+80),href:selectionHref(),mark:selectedMark(r)?.dataset.estanteHighlight||null};}if(!s||s.mark||s.text.trim().length<2||s.text.length>5000)return;EstanteHighlights.onTextSelection(s.href,s.text,s.start,s.end,s.prefix,s.suffix);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();};
+          window.estanteRemoveSelectedHighlight=function(){var s=window.estanteSelectionSnapshot,selection=getSelection(),mark=s&&s.mark;if(!mark&&selection&&selection.rangeCount){var found=selectedMark(selection.getRangeAt(0));mark=found&&found.dataset.estanteHighlight;}if(mark)EstanteHighlights.onRemoveHighlight(mark);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();return mark||'';};
+          window.estanteChangeSelectedHighlightColor=function(color){var s=window.estanteSelectionSnapshot,selection=getSelection(),mark=s&&s.mark;if(!mark&&selection&&selection.rangeCount){var found=selectedMark(selection.getRangeAt(0));mark=found&&found.dataset.estanteHighlight;}if(mark)EstanteHighlights.onChangeHighlightColor(mark,color);window.estanteSelectionSnapshot=null;if(selection)selection.removeAllRanges();return mark||'';};
+          window.estanteCopySelection=function(){var selection=getSelection(),text=selection&&!selection.isCollapsed?String(selection):window.estanteSelectionSnapshot?.text;if(text)EstanteHighlights.onCopyText(text);};
           function reportSelection(){
             var selection=window.getSelection();if(!selection||!selection.rangeCount)return;
-            var quote=String(selection).trim();if(quote.length<2||quote.length>5000)return;
-            var range=selection.getRangeAt(0);if(range.collapsed)return;
+            var range=selection.getRangeAt(0);if(range.collapsed||!content.contains(range.commonAncestorContainer)){window.estanteSelectionSnapshot=null;EstanteHighlights.onSelectionHasHighlight(false);return;}
             var start=offsetAt(range.startContainer,range.startOffset);var end=offsetAt(range.endContainer,range.endOffset);
             if(end<=start)return;
-            var before=document.createRange();before.selectNodeContents(document.body);before.setEnd(range.startContainer,range.startOffset);
-            var after=document.createRange();after.selectNodeContents(document.body);after.setStart(range.endContainer,range.endOffset);
-            var prefix=before.toString().slice(-80);var suffix=after.toString().slice(0,80);var href=selectionHref();
-            var key=href+'|'+start+'|'+end+'|'+quote;if(key===window.estanteLastSelection)return;window.estanteLastSelection=key;
-            EstanteHighlights.onTextSelection(href,quote,start,end,prefix,suffix);
-            setTimeout(function(){var current=window.getSelection();if(current)current.removeAllRanges();},0);
+            if(start<0||end<=start)return;
+            var mark=selectedMark(range),href=selectionHref();
+            window.estanteSelectionSnapshot={start:start,end:end,text:range.toString(),prefix:flatText.slice(Math.max(0,start-80),start),suffix:flatText.slice(end,end+80),href:href,mark:mark?mark.dataset.estanteHighlight:null};
+            EstanteHighlights.onSelectionHasHighlight(!!mark);
           }
-          function scheduleSelection(){clearTimeout(window.estanteSelectionTimer);window.estanteSelectionTimer=setTimeout(reportSelection,450);}
-          if(!window.estanteSelectionListener){document.addEventListener('selectionchange',scheduleSelection);document.addEventListener('mouseup',scheduleSelection);document.addEventListener('touchend',function(){setTimeout(scheduleSelection,180);});window.estanteSelectionListener=true;}
+          function scheduleSelection(){clearTimeout(window.estanteSelectionTimer);window.estanteSelectionTimer=setTimeout(reportSelection,60);}
+          if(!window.estanteSelectionListener){document.addEventListener('selectionchange',scheduleSelection);window.estanteSelectionListener=true;}
         })();
     """.trimIndent()
     evaluateJavascript(script, null)
