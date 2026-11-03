@@ -101,7 +101,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -114,8 +113,6 @@ import com.estante.reader.core.reader.ReaderSpreadBuilder
 import com.estante.reader.core.publication.PublicationBookmark
 import com.estante.reader.core.archive.PdfPageDocument
 import eu.wewox.pagecurl.ExperimentalPageCurlApi
-import eu.wewox.pagecurl.config.PageCurlConfig
-import eu.wewox.pagecurl.config.rememberPageCurlConfig
 import eu.wewox.pagecurl.page.PageCurl
 import eu.wewox.pagecurl.page.PageCurlState
 import kotlin.math.max
@@ -866,31 +863,7 @@ private fun ComicReaderScreen(
                 zoomedPages = if (zoomed) zoomedPages + page else zoomedPages - page
             }
             val isLeftToRight = state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT
-            val leftHalf = Rect(0f, 0f, 0.5f, 1f)
-            val rightHalf = Rect(0.5f, 0f, 1f, 1f)
-            val curlDragInteraction = PageCurlConfig.StartEndDragInteraction(
-                pointerBehavior = PageCurlConfig.DragInteraction.PointerBehavior.PageEdge,
-                forward = PageCurlConfig.StartEndDragInteraction.Config(
-                    start = if (isLeftToRight) rightHalf else leftHalf,
-                    end = if (isLeftToRight) leftHalf else rightHalf,
-                ),
-                backward = PageCurlConfig.StartEndDragInteraction.Config(
-                    start = if (isLeftToRight) leftHalf else rightHalf,
-                    end = if (isLeftToRight) rightHalf else leftHalf,
-                ),
-            )
-            val pageCurlConfig = rememberPageCurlConfig(
-                backPageColor = readerBackground.color,
-                backPageContentAlpha = 0.08f,
-                shadowColor = Color.Black,
-                shadowAlpha = 0.28f,
-                shadowRadius = 18.dp,
-                shadowOffset = DpOffset((-6).dp, 0.dp),
-                dragInteraction = curlDragInteraction,
-                tapForwardEnabled = false,
-                tapBackwardEnabled = false,
-                tapCustomEnabled = false,
-            )
+            val curlDragInteraction = readerPageCurlDragInteraction(state.readingDirection)
             val canTurnBackward = if (doublePage) {
                 previousSpreadPage != null && state.previousSpreadImages != null
             } else {
@@ -904,6 +877,12 @@ private fun ComicReaderScreen(
             val pageTurnInteractionEnabled = !state.isLoading && !state.selectionMode &&
                 !lensVisible && !controlsVisible &&
                 state.pageIndex !in zoomedPages && (!doublePage || companionIndex !in zoomedPages)
+            val pageCurlConfig = rememberReaderPageCurlConfig(
+                backgroundColor = readerBackground.color,
+                readingDirection = state.readingDirection,
+                dragForwardEnabled = pageTurnInteractionEnabled && canTurnForward,
+                dragBackwardEnabled = pageTurnInteractionEnabled && canTurnBackward,
+            )
             SideEffect {
                 pageCurlConfig.dragInteraction = curlDragInteraction
                 pageCurlConfig.dragBackwardEnabled = pageTurnInteractionEnabled && canTurnBackward
@@ -1317,7 +1296,11 @@ private fun PageCanvas(
                 )
             }
             .onSizeChanged { viewportSize = IntSize(it.width, it.height) }
-            .transformable(state = transformState, enabled = !selectionMode)
+            .pageCanvasTransformable(
+                state = transformState,
+                currentScale = { zoomScale },
+                enabled = !selectionMode,
+            )
             .clipToBounds()
             .graphicsLayer {
                 scaleX = zoomScale

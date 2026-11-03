@@ -17,17 +17,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.unit.DpOffset
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import eu.wewox.pagecurl.ExperimentalPageCurlApi
-import eu.wewox.pagecurl.config.PageCurlConfig
-import eu.wewox.pagecurl.config.rememberPageCurlConfig
 import eu.wewox.pagecurl.page.PageCurl
 import eu.wewox.pagecurl.page.PageCurlState
 import com.estante.reader.core.guided.ReadingDirection
@@ -341,27 +335,11 @@ private fun BookCurl(
     val forward = turn.direction > 0
     val state = turn.animation
     val drag = turn.drag
-    val leftHalf = Rect(0f, 0f, 0.5f, 1f)
-    val rightHalf = Rect(0.5f, 0f, 1f, 1f)
-    val forwardStart = if (readingDirection == ReadingDirection.LEFT_TO_RIGHT) rightHalf else leftHalf
-    val forwardEnd = if (readingDirection == ReadingDirection.LEFT_TO_RIGHT) leftHalf else rightHalf
-    val config = rememberPageCurlConfig(
-        backPageColor = background.color,
-        backPageContentAlpha = 0.08f,
-        shadowColor = Color.Black,
-        shadowAlpha = 0.28f,
-        shadowRadius = 18.dp,
-        shadowOffset = DpOffset((-6).dp, 0.dp),
-        dragInteraction = PageCurlConfig.StartEndDragInteraction(
-            pointerBehavior = PageCurlConfig.DragInteraction.PointerBehavior.PageEdge,
-            forward = PageCurlConfig.StartEndDragInteraction.Config(forwardStart, forwardEnd),
-            backward = PageCurlConfig.StartEndDragInteraction.Config(forwardEnd, forwardStart),
-        ),
+    val config = rememberReaderPageCurlConfig(
+        backgroundColor = background.color,
+        readingDirection = readingDirection,
         dragForwardEnabled = drag != null && forward,
         dragBackwardEnabled = drag != null && !forward,
-        tapForwardEnabled = false,
-        tapBackwardEnabled = false,
-        tapCustomEnabled = false,
     )
     PageCurl(count = if (drag == null) 2 else 3, state = state, config = config, modifier = modifier.fillMaxSize()) { page ->
         val bitmap = if (drag == null) {
