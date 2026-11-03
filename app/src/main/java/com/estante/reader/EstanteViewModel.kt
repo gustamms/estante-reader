@@ -12,6 +12,7 @@ import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.estante.reader.core.archive.OpenedPageDocument
+import com.estante.reader.core.archive.PdfPageDocument
 import com.estante.reader.core.archive.PageDocument
 import com.estante.reader.core.archive.PageDocumentFactory
 import com.estante.reader.core.analysis.OrtBubbleDetector
@@ -78,6 +79,7 @@ private val PanoramasAlonePreference = booleanPreferencesKey("panoramas_alone")
 private val LibraryStylePreference = stringPreferencesKey("library_style")
 private val ReaderCanvasBackgroundPreference = stringPreferencesKey("reader_canvas_background")
 private val GuidedModePreference = booleanPreferencesKey("guided_mode_enabled")
+private const val GuidedModeDocumentPrefix = "guided_mode_document_"
 private val BookLocationPrefix = "book_location_"
 private val BookFontSizePrefix = "book_font_size_"
 private val BookColumnModePrefix = "book_column_mode_"
@@ -101,6 +103,7 @@ data class ReaderUiState(
     val isLoading: Boolean = false,
     val isImporting: Boolean = false,
     val title: String? = null,
+    val documentFormatId: String? = null,
     val lastReadTitle: String? = null,
     val lastReadPage: Int = 0,
     val pageCount: Int = 0,
@@ -148,6 +151,11 @@ data class ReaderUiState(
     val bookLineSpacing: Float = 1.72f,
     val bookMarginsDp: Float = 26f,
     val publicationBookmarks: List<PublicationBookmark> = emptyList(),
+    val pageBookmarks: List<PublicationBookmark> = emptyList(),
+    val pdfTextSearchResults: List<PdfPageDocument.TextSearchResult> = emptyList(),
+    val isSearchingPdfText: Boolean = false,
+    val pdfTextSearchError: String? = null,
+    val pageSearchMatches: List<com.estante.reader.core.guided.NormalizedRect> = emptyList(),
     val publicationHighlights: List<BookHighlightEntity> = emptyList(),
     val bookHighlightColorId: String = BookHighlightColor.default.id,
     val pendingBookHighlight: BookHighlightEntity? = null,
@@ -180,6 +188,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     private var bookProgressJob: Job? = null
     private var bookSettingsJob: Job? = null
     private var bookHighlightsJob: Job? = null
+    private var pdfSearchJob: Job? = null
+    private var pdfSearchRequestId = 0L
     private var analysisJob: Job? = null
     private var focusLastRegionOnPageLoad = false
     private var preferredRegionIndex = 0
@@ -583,6 +593,16 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 val comicPanoramasAlone = savedPreferences[booleanPreferencesKey("panoramas_alone_${comic.id}")]
                     ?: savedPreferences[PanoramasAlonePreference]
                     ?: true
+                val pageBookmarks = runCatching {
+                    val array = org.json.JSONArray(savedPreferences[stringPreferencesKey("$BookmarksPrefix${comic.id}")].orEmpty())
+                    (0 until array.length()).map { index ->
+                        val item = array.getJSONObject(index)
+                        PublicationBookmark(item.getInt("chapter"), item.optDouble("progress", 0.0).toFloat(), item.optString("title"))
+                    }.filter { it.chapterIndex in 0 until indexed.pageCount }
+                }.getOrDefault(emptyList())
+                val guidedModeForDocument = if (comic.format == ComicFormat.PDF) {
+                    savedPreferences[booleanPreferencesKey("$GuidedModeDocumentPrefix${comic.id}")] ?: false
+                } else _state.value.guidedModeEnabled
                 preferredRegionIndex = comic.lastRegionId?.let { regionId ->
                     val saved = analysisStore.read(fingerprint, OrtBubbleDetector.VERSION, page).orEmpty()
                     GuidedPage(saved).orderedRegions(_state.value.readingDirection).indexOfFirst { it.id == regionId }
@@ -598,25 +618,29 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 }
                 _state.value = ReaderUiState(
                     title = comic.title,
+                    documentFormatId = comic.format.name,
+                    pageBookmarks = pageBookmarks,
                     lastReadTitle = comic.title,
                     pageCount = indexed.pageCount,
                     pageIndex = page,
                     lastReadPage = page,
                     libraryStyleId = _state.value.libraryStyleId,
                     readerCanvasBackgroundId = _state.value.readerCanvasBackgroundId,
-                    guidedModeEnabled = _state.value.guidedModeEnabled,
+                    guidedModeEnabled = guidedModeForDocument,
                     readingDirection = _state.value.readingDirection,
                     pageDisplayMode = comicDisplayMode,
                     separateCover = comicSeparateCover,
                     panoramasAlone = comicPanoramasAlone,
-                    isAnalyzing = cachedPages < indexed.pageCount,
+                    isAnalyzing = guidedModeForDocument && cachedPages < indexed.pageCount,
                     analyzedPages = cachedPages,
                     analysisPageCount = indexed.pageCount,
                     isLoading = true,
                 )
                 libraryRepository.recordOpened(id, comic.title, indexed.pageCount, page, comic.lastRegionId)
                 loadPage(page)
-                startAnalysis(indexed, Uri.fromFile(file), fingerprint)
+                if (guidedModeForDocument) {
+                    startAnalysis(indexed, Uri.fromFile(file), fingerprint)
+                }
             } catch (error: Exception) {
                 if (openedDocument?.document !== pageDocument) openedDocument?.document?.close()
                 closePageDocument()
@@ -651,6 +675,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
                 preferences.remove(stringPreferencesKey("$BookHighlightColorPrefix$id"))
                 preferences.remove(stringPreferencesKey("page_display_mode_$id"))
                 preferences.remove(booleanPreferencesKey("separate_cover_$id"))
+                preferences.remove(booleanPreferencesKey("$GuidedModeDocumentPrefix$id"))
             }
         }
     }
@@ -697,6 +722,8 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
         adjacentSpreadsJob?.cancel()
         spreadPageJob?.cancel()
         analysisJob?.cancel()
+        pdfSearchJob?.cancel()
+        pdfSearchRequestId++
         bookHighlightsJob?.cancel()
         closePageDocument()
         sourceUri = null
@@ -743,9 +770,50 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     fun goToPage(index: Int) {
         val current = _state.value
         if (index in 0 until current.pageCount && index != current.pageIndex) {
+            _state.value = current.copy(pageSearchMatches = emptyList())
             if (!focusLastRegionOnPageLoad) preferredRegionIndex = 0
             loadPage(index)
         }
+    }
+
+    fun searchPdfText(query: String) {
+        val document = pageDocument as? PdfPageDocument ?: return
+        val term = query.trim()
+        if (term.isEmpty()) {
+            pdfSearchRequestId++
+            pdfSearchJob?.cancel()
+            _state.value = _state.value.copy(pdfTextSearchResults = emptyList(), isSearchingPdfText = false, pdfTextSearchError = null)
+            return
+        }
+        val requestId = ++pdfSearchRequestId
+        pdfSearchJob?.cancel()
+        val uri = sourceUri
+        _state.value = _state.value.copy(isSearchingPdfText = true, pdfTextSearchResults = emptyList(), pdfTextSearchError = null)
+        pdfSearchJob = viewModelScope.launch {
+            try {
+                val results = withContext(Dispatchers.IO) { document.searchText(term) }
+                if (requestId == pdfSearchRequestId && sourceUri == uri) {
+                    _state.value = _state.value.copy(
+                        pdfTextSearchResults = results.orEmpty(),
+                        isSearchingPdfText = false,
+                        pdfTextSearchError = if (results == null) "A busca textual em PDF requer Android 15 ou posterior. PDFs digitalizados também precisam de OCR." else null,
+                    )
+                }
+            } catch (error: Exception) {
+                if (requestId == pdfSearchRequestId && sourceUri == uri && error !is kotlinx.coroutines.CancellationException) {
+                    _state.value = _state.value.copy(isSearchingPdfText = false, pdfTextSearchError = "Não foi possível buscar o texto deste PDF.")
+                }
+            }
+        }
+    }
+
+    fun openPdfTextSearchResult(result: PdfPageDocument.TextSearchResult) {
+        goToPage(result.pageIndex)
+        _state.value = _state.value.copy(
+            pageSearchMatches = result.matches.map { bounds ->
+                NormalizedRect.clipped(bounds.left, bounds.top, bounds.right, bounds.bottom)
+            }.filterNotNull(),
+        )
     }
 
     fun recordBookProgress(chapterIndex: Int, progression: Float) {
@@ -828,6 +896,33 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             updated.forEach { item -> array.put(org.json.JSONObject().put("chapter", item.chapterIndex).put("progress", item.progression).put("title", item.title)) }
             getApplication<Application>().readerPreferences.edit { it[stringPreferencesKey("$BookmarksPrefix$id")] = array.toString() }
         } }
+    }
+
+    fun addPageBookmark() {
+        val current = _state.value
+        if (current.publicationRootPath != null || current.pageCount == 0) return
+        val bookmark = PublicationBookmark(current.pageIndex, 0f, "Página ${current.pageIndex + 1}")
+        val updated = (current.pageBookmarks + bookmark).distinctBy { it.chapterIndex }
+        _state.value = current.copy(pageBookmarks = updated)
+        persistPageBookmarks(currentComicId, updated)
+    }
+
+    fun removePageBookmark(bookmark: PublicationBookmark) {
+        val current = _state.value
+        val updated = current.pageBookmarks.filterNot { it.chapterIndex == bookmark.chapterIndex }
+        _state.value = current.copy(pageBookmarks = updated)
+        persistPageBookmarks(currentComicId, updated)
+    }
+
+    private fun persistPageBookmarks(id: String?, bookmarks: List<PublicationBookmark>) {
+        if (id == null) return
+        viewModelScope.launch {
+            val array = org.json.JSONArray()
+            bookmarks.forEach { item ->
+                array.put(org.json.JSONObject().put("chapter", item.chapterIndex).put("progress", item.progression).put("title", item.title))
+            }
+            getApplication<Application>().readerPreferences.edit { it[stringPreferencesKey("$BookmarksPrefix$id")] = array.toString() }
+        }
     }
 
     /** Saves the browser's final text selection without interrupting the selection gesture. */
@@ -1106,6 +1201,7 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
             ReaderSpreadBuilder.forPage(it, current.pageCount, current.separateCover)
         }
         adjacentSpreadsJob?.cancel()
+        pdfSearchJob?.cancel()
         val requestId = pageRequestId
         val pageIndex = current.pageIndex
         _state.value = current.copy(previousSpreadImages = null, nextSpreadImages = null)
@@ -1158,9 +1254,35 @@ class EstanteViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setGuidedModeEnabled(enabled: Boolean) {
-        _state.value = _state.value.copy(guidedModeEnabled = enabled)
-        viewModelScope.launch {
-            getApplication<Application>().readerPreferences.edit { it[GuidedModePreference] = enabled }
+        val current = _state.value
+        val isPdf = current.documentFormatId == ComicFormat.PDF.name
+        _state.value = current.copy(
+            guidedModeEnabled = enabled,
+            isAnalyzing = enabled && isPdf,
+            analysisError = if (enabled) null else current.analysisError,
+        )
+        if (isPdf) {
+            currentComicId?.let { id ->
+                viewModelScope.launch {
+                    getApplication<Application>().readerPreferences.edit {
+                        it[booleanPreferencesKey("$GuidedModeDocumentPrefix$id")] = enabled
+                    }
+                }
+            }
+            if (enabled) {
+                val document = pageDocument
+                val uri = sourceUri
+                val fingerprint = documentFingerprint
+                if (document != null && uri != null && fingerprint != null) startAnalysis(document, uri, fingerprint)
+            } else {
+                analysisJob?.cancel()
+                analysisJob = null
+                _state.value = _state.value.copy(isAnalyzing = false, isAnalyzingCurrentPage = false)
+            }
+        } else {
+            viewModelScope.launch {
+                getApplication<Application>().readerPreferences.edit { it[GuidedModePreference] = enabled }
+            }
         }
     }
 

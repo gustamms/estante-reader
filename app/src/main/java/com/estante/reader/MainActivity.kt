@@ -24,6 +24,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -37,7 +39,9 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -69,6 +73,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -78,6 +84,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
@@ -104,6 +111,8 @@ import com.estante.reader.core.guided.NormalizedRect
 import com.estante.reader.core.reader.PageDisplayMode
 import com.estante.reader.core.reader.ReaderSpread
 import com.estante.reader.core.reader.ReaderSpreadBuilder
+import com.estante.reader.core.publication.PublicationBookmark
+import com.estante.reader.core.archive.PdfPageDocument
 import eu.wewox.pagecurl.ExperimentalPageCurlApi
 import eu.wewox.pagecurl.config.PageCurlConfig
 import eu.wewox.pagecurl.config.rememberPageCurlConfig
@@ -180,6 +189,7 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
                 marginsDp = state.bookMarginsDp,
                 columnMode = state.bookColumnMode,
                 background = ReaderCanvasBackground.fromId(state.readerCanvasBackgroundId),
+                readingDirection = state.readingDirection,
                 capabilities = state.publicationCapabilities,
                 bookmarks = state.publicationBookmarks,
                 highlights = state.publicationHighlights,
@@ -204,6 +214,13 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
                 onPendingHighlightConsumed = viewModel::clearPendingBookHighlight,
                 onSearch = viewModel::searchPublication,
                 onOpenSearchResult = { result -> viewModel.recordBookProgress(result.chapterIndex, result.progression) },
+                onToggleDirection = {
+                    viewModel.setReadingDirection(
+                        if (state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT) {
+                            com.estante.reader.core.guided.ReadingDirection.RIGHT_TO_LEFT
+                        } else com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT,
+                    )
+                },
             )
         } else ComicReaderScreen(
             state = state,
@@ -239,6 +256,10 @@ private fun EstanteApp(viewModel: EstanteViewModel = viewModel()) {
             onSetReaderCanvasBackground = viewModel::setReaderCanvasBackground,
             onLoadSpreadPage = viewModel::loadSpreadPage,
             onLoadNeighborSpreads = viewModel::loadNeighborSpreads,
+            onAddPageBookmark = viewModel::addPageBookmark,
+            onRemovePageBookmark = viewModel::removePageBookmark,
+            onSearchPdfText = viewModel::searchPdfText,
+            onOpenPdfTextSearchResult = viewModel::openPdfTextSearchResult,
         )
     } else if (showSettings) {
         LibraryAppearanceScreen(
@@ -767,18 +788,28 @@ private fun ComicReaderScreen(
     onSetReaderCanvasBackground: (ReaderCanvasBackground) -> Unit = {},
     onLoadSpreadPage: (Int?) -> Unit = {},
     onLoadNeighborSpreads: (Int?, Int?) -> Unit = { _, _ -> },
+    onAddPageBookmark: () -> Unit = {},
+    onRemovePageBookmark: (PublicationBookmark) -> Unit = {},
+    onSearchPdfText: (String) -> Unit = {},
+    onOpenPdfTextSearchResult: (PdfPageDocument.TextSearchResult) -> Unit = {},
 ) {
     val clipboard = LocalContext.current.getSystemService(ClipboardManager::class.java)
     val context = LocalContext.current
     val view = LocalView.current
     val window = (context as? Activity)?.window
     var controlsVisible by remember(state.title) { mutableStateOf(false) }
+    var pageBookmarksVisible by remember(state.title) { mutableStateOf(false) }
+    var pdfSearchVisible by remember(state.title) { mutableStateOf(false) }
+    var pdfSearchQuery by remember(state.title) { mutableStateOf("") }
     var lensVisible by remember(state.title, state.pageIndex) { mutableStateOf(false) }
     var lensPageIndex by remember(state.title, state.pageIndex) { mutableIntStateOf(state.pageIndex) }
     var companionActiveRegion by remember(state.title, state.pageIndex) { mutableIntStateOf(0) }
+    var zoomedPages by remember(state.title) { mutableStateOf(emptySet<Int>()) }
     val pageTurnScope = rememberCoroutineScope()
     BackHandler {
         when {
+            pdfSearchVisible -> pdfSearchVisible = false
+            pageBookmarksVisible -> pageBookmarksVisible = false
             controlsVisible -> controlsVisible = false
             lensVisible -> lensVisible = false
             else -> onClose()
@@ -793,10 +824,12 @@ private fun ComicReaderScreen(
     val readerBackground = ReaderCanvasBackground.fromId(state.readerCanvasBackgroundId)
     Surface(modifier = Modifier.fillMaxSize(), color = readerBackground.color) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
+            val pageViewportWidth = maxWidth
+            val pageViewportHeight = maxHeight
             val requestedDoublePage = when (state.pageDisplayMode) {
                 PageDisplayMode.SINGLE_PAGE -> false
                 PageDisplayMode.DOUBLE_PAGE -> true
-                PageDisplayMode.AUTOMATIC -> maxWidth >= 600.dp
+                PageDisplayMode.AUTOMATIC -> maxWidth >= 680.dp
             }
             val bitmap = state.bitmap
             val baseSpread = ReaderSpreadBuilder.forPage(state.pageIndex, state.pageCount, state.separateCover)
@@ -828,6 +861,9 @@ private fun ComicReaderScreen(
             } else displaySpread?.let { ReaderSpreadBuilder.next(it, state.pageCount, state.separateCover) }
             val pageTurnState = remember(state.title, state.pageIndex, doublePage) {
                 PageCurlState(initialMax = 3, initialCurrent = 1)
+            }
+            val onZoomStateChange: (Int, Boolean) -> Unit = { page, zoomed ->
+                zoomedPages = if (zoomed) zoomedPages + page else zoomedPages - page
             }
             val isLeftToRight = state.readingDirection == com.estante.reader.core.guided.ReadingDirection.LEFT_TO_RIGHT
             val leftHalf = Rect(0f, 0f, 0.5f, 1f)
@@ -866,7 +902,8 @@ private fun ComicReaderScreen(
                 state.pageIndex + 1 < state.pageCount && state.nextPageBitmap != null
             }
             val pageTurnInteractionEnabled = !state.isLoading && !state.selectionMode &&
-                !lensVisible && !controlsVisible
+                !lensVisible && !controlsVisible &&
+                state.pageIndex !in zoomedPages && (!doublePage || companionIndex !in zoomedPages)
             SideEffect {
                 pageCurlConfig.dragInteraction = curlDragInteraction
                 pageCurlConfig.dragBackwardEnabled = pageTurnInteractionEnabled && canTurnBackward
@@ -883,7 +920,6 @@ private fun ComicReaderScreen(
                 }
                 if (target != null) {
                     lensVisible = false
-                    controlsVisible = false
                     onPageChange(target)
                 } else if (pageTurnState.current != 1) {
                     pageTurnState.snapTo(1)
@@ -900,12 +936,26 @@ private fun ComicReaderScreen(
             }
             if (bitmap != null) {
                 val onTapBackground: (Offset, IntSize) -> Unit = { point, size ->
-                    if (point.x in size.width * 0.30f..size.width * 0.70f) {
-                        controlsVisible = !controlsVisible
-                        if (controlsVisible) lensVisible = false
-                    } else if (lensVisible || controlsVisible) {
-                        lensVisible = false
-                        controlsVisible = false
+                    val zoomed = state.pageIndex in zoomedPages || (doublePage && companionIndex in zoomedPages)
+                    val edgeDirection = ReaderInteraction.edgeTurnDirection(point.x, size.width.toFloat(), state.readingDirection)
+                    when {
+                        zoomed -> Unit
+                        edgeDirection == 1 && pageTurnInteractionEnabled && canTurnForward -> {
+                            lensVisible = false
+                            pageTurnScope.launch { pageTurnState.next() }
+                        }
+                        edgeDirection == -1 && pageTurnInteractionEnabled && canTurnBackward -> {
+                            lensVisible = false
+                            pageTurnScope.launch { pageTurnState.prev() }
+                        }
+                        !state.selectionMode && ReaderInteraction.isCenterTap(point.x, point.y, size.width.toFloat(), size.height.toFloat()) -> {
+                            controlsVisible = !controlsVisible
+                            if (controlsVisible) lensVisible = false
+                        }
+                        lensVisible || controlsVisible -> {
+                            lensVisible = false
+                            controlsVisible = false
+                        }
                     }
                 }
                 PageCurl(
@@ -944,6 +994,9 @@ private fun ComicReaderScreen(
                                 onBackgroundTap = onTapBackground,
                                 onLongPress = { controlsVisible = true; lensVisible = false },
                                 onDismissLens = { lensVisible = false },
+                                searchMatches = state.pageSearchMatches,
+                                pageIndex = state.pageIndex,
+                                onZoomStateChange = onZoomStateChange,
                             )
                         } else {
                             val spread = displaySpread
@@ -960,6 +1013,9 @@ private fun ComicReaderScreen(
                                     val pageBitmap = if (isCurrent) bitmap else companion
                                     val pageRegions = if (isCurrent) regions else companionRegions
                                     val pageActiveRegion = if (isCurrent) activeRegionIndex else companionActiveRegion
+                                    val pageGapPx = with(LocalDensity.current) { 20.dp.toPx() }
+                                    val wholeWidthPx = with(LocalDensity.current) { pageViewportWidth.toPx() }
+                                    val wholeHeightPx = with(LocalDensity.current) { pageViewportHeight.toPx() }
                                     PageCanvas(
                                         modifier = Modifier.weight(1f).fillMaxHeight(),
                                         bitmap = pageBitmap,
@@ -975,9 +1031,17 @@ private fun ComicReaderScreen(
                                             controlsVisible = false
                                         },
                                         onRegionSelected = {},
-                                        onBackgroundTap = onTapBackground,
+                                        onBackgroundTap = { point, pageSize ->
+                                            onTapBackground(
+                                                Offset(pagePosition * (pageSize.width + pageGapPx) + point.x, point.y),
+                                                IntSize(wholeWidthPx.toInt(), wholeHeightPx.toInt()),
+                                            )
+                                        },
                                         onLongPress = { controlsVisible = true; lensVisible = false },
                                         onDismissLens = { lensVisible = false },
+                                        searchMatches = if (isCurrent) state.pageSearchMatches else emptyList(),
+                                        pageIndex = pageIndex,
+                                        onZoomStateChange = onZoomStateChange,
                                     )
                                 }
                             }
@@ -999,6 +1063,8 @@ private fun ComicReaderScreen(
                     totalAnalysisPageCount = totalAnalysisPageCount,
                     canTurnBackward = !state.isLoading && pageTurnState.progress == 0f && canTurnBackward,
                     canTurnForward = !state.isLoading && pageTurnState.progress == 0f && canTurnForward,
+                    pageBookmarks = state.pageBookmarks,
+                    canSearchPageText = state.documentFormatId == "PDF",
                     pageLabel = if (spreadMode) {
                         "Páginas ${displaySpread.first + 1}–${displaySpread.second + 1} de ${state.pageCount}"
                     } else "Página ${state.pageIndex + 1} de ${state.pageCount}",
@@ -1017,6 +1083,9 @@ private fun ComicReaderScreen(
                             pageTurnScope.launch { pageTurnState.next() }
                         }
                     },
+                    onAddBookmark = onAddPageBookmark,
+                    onShowBookmarks = { pageBookmarksVisible = true; controlsVisible = false },
+                    onShowSearch = { pdfSearchVisible = true; pdfSearchQuery = ""; controlsVisible = false },
                     onSetPageDisplayMode = onSetPageDisplayMode,
                     onToggleDirection = onToggleDirection,
                     onSetGuidedMode = onSetGuidedMode,
@@ -1036,6 +1105,70 @@ private fun ComicReaderScreen(
                     onCopyText = { text -> clipboard?.setPrimaryClip(ClipData.newPlainText("Texto reconhecido", text)) },
                 )
             }
+        }
+        if (pageBookmarksVisible) {
+            AlertDialog(
+                onDismissRequest = { pageBookmarksVisible = false },
+                title = { Text("Marcadores") },
+                text = {
+                    if (state.pageBookmarks.isEmpty()) Text("Nenhum marcador salvo neste documento.")
+                    else Column(Modifier.heightIn(max = 320.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
+                        state.pageBookmarks.sortedBy { it.chapterIndex }.forEach { bookmark ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(
+                                    modifier = Modifier.weight(1f),
+                                    onClick = { pageBookmarksVisible = false; onPageChange(bookmark.chapterIndex) },
+                                ) { Text(bookmark.title, maxLines = 1) }
+                                TextButton(onClick = { onRemovePageBookmark(bookmark) }) { Text("Remover") }
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { pageBookmarksVisible = false }) { Text("Fechar") } },
+            )
+        }
+        if (pdfSearchVisible) {
+            AlertDialog(
+                onDismissRequest = { pdfSearchVisible = false },
+                title = { Text("Buscar texto no PDF") },
+                text = {
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            OutlinedTextField(
+                                value = pdfSearchQuery,
+                                onValueChange = { pdfSearchQuery = it },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
+                                label = { Text("Buscar") },
+                            )
+                            TextButton(
+                                onClick = { onSearchPdfText(pdfSearchQuery) },
+                                enabled = pdfSearchQuery.isNotBlank() && !state.isSearchingPdfText,
+                            ) { Text(if (state.isSearchingPdfText) "Buscando…" else "Buscar") }
+                        }
+                        state.pdfTextSearchError?.let { Text(it, Modifier.padding(top = 8.dp), color = Color(0xFF706B62)) }
+                        if (!state.isSearchingPdfText && state.pdfTextSearchResults.isEmpty() && state.pdfTextSearchError == null && pdfSearchQuery.isNotBlank()) {
+                            Text("Nenhum texto encontrado. Se o PDF for digitalizado, a busca por OCR ainda não está disponível.", Modifier.padding(top = 8.dp))
+                        }
+                        if (state.pdfTextSearchResults.isNotEmpty()) {
+                            Column(Modifier.heightIn(max = 280.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())) {
+                                state.pdfTextSearchResults.forEach { result ->
+                                    TextButton(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        onClick = { onOpenPdfTextSearchResult(result); pdfSearchVisible = false },
+                                    ) {
+                                        Column(Modifier.fillMaxWidth()) {
+                                            Text("Página ${result.pageIndex + 1}", color = Color(0xFFA95138))
+                                            Text(result.snippet, maxLines = 2, color = Color(0xFF292722))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton(onClick = { pdfSearchVisible = false }) { Text("Fechar") } },
+            )
         }
     }
 }
@@ -1097,11 +1230,40 @@ private fun PageCanvas(
     onBackgroundTap: (Offset, IntSize) -> Unit = { _, _ -> },
     onLongPress: () -> Unit = {},
     onDismissLens: () -> Unit = {},
+    searchMatches: List<NormalizedRect> = emptyList(),
+    pageIndex: Int = -1,
+    onZoomStateChange: (Int, Boolean) -> Unit = { _, _ -> },
 ) {
     var dragStart by remember(bitmap) { mutableStateOf<Offset?>(null) }
     var dragPreview by remember(bitmap) { mutableStateOf<NormalizedRect?>(null) }
+    var zoomScale by remember(bitmap) { androidx.compose.runtime.mutableFloatStateOf(1f) }
+    var zoomOffset by remember(bitmap) { mutableStateOf(Offset.Zero) }
+    var viewportSize by remember(bitmap) { mutableStateOf(IntSize.Zero) }
     val bitmapImage: ImageBitmap = remember(bitmap) { bitmap.asImageBitmap() }
     val activeBounds = regions.getOrNull(activeRegionIndex)?.bounds ?: selected
+    val transformState = rememberTransformableState { centroid, zoomChange, panChange, _ ->
+        val previousScale = zoomScale
+        val newScale = (zoomScale * zoomChange).coerceIn(1f, 4f)
+        zoomScale = newScale
+        if (newScale <= 1f) {
+            zoomOffset = Offset.Zero
+        } else {
+            val limitX = viewportSize.width * (newScale - 1f) / 2f
+            val limitY = viewportSize.height * (newScale - 1f) / 2f
+            val factor = newScale / previousScale
+            val pivot = Offset(centroid.x - viewportSize.width / 2f, centroid.y - viewportSize.height / 2f)
+            zoomOffset = Offset(
+                (pivot.x + (zoomOffset.x - pivot.x) * factor + panChange.x).coerceIn(-limitX, limitX),
+                (pivot.y + (zoomOffset.y - pivot.y) * factor + panChange.y).coerceIn(-limitY, limitY),
+            )
+        }
+    }
+    LaunchedEffect(pageIndex, zoomScale > 1f) {
+        if (pageIndex >= 0) onZoomStateChange(pageIndex, zoomScale > 1f)
+    }
+    DisposableEffect(pageIndex) {
+        onDispose { if (pageIndex >= 0) onZoomStateChange(pageIndex, false) }
+    }
     BoxWithConstraints(
         modifier = modifier
             .pointerInput(bitmap, regions, selectionMode) {
@@ -1153,6 +1315,15 @@ private fun PageCanvas(
                         dragPreview = null
                     },
                 )
+            }
+            .onSizeChanged { viewportSize = IntSize(it.width, it.height) }
+            .transformable(state = transformState, enabled = !selectionMode)
+            .clipToBounds()
+            .graphicsLayer {
+                scaleX = zoomScale
+                scaleY = zoomScale
+                translationX = zoomOffset.x
+                translationY = zoomOffset.y
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -1176,6 +1347,13 @@ private fun PageCanvas(
                         style = Stroke(width = 2.5.dp.toPx()),
                     )
                 }
+            }
+            searchMatches.forEach { match ->
+                drawRect(
+                    color = Color(0x66F5CF59),
+                    topLeft = Offset(fit.left + match.left * fit.width, fit.top + match.top * fit.height),
+                    size = Size(match.width * fit.width, match.height * fit.height),
+                )
             }
             val rect = dragPreview ?: if (guidedMode) null else selected
             if (rect != null && selectionMode) {

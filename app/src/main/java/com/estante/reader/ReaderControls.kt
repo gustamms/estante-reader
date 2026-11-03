@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -45,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.estante.reader.core.guided.ReadingDirection
 import com.estante.reader.core.reader.PageDisplayMode
+import com.estante.reader.core.publication.PublicationBookmark
 import kotlin.math.roundToInt
 
 enum class ReaderCanvasBackground(val id: String, val label: String, val color: Color) {
@@ -70,12 +72,17 @@ internal fun ReaderControlsOverlay(
     totalAnalysisPageCount: Int,
     canTurnBackward: Boolean,
     canTurnForward: Boolean,
+    pageBookmarks: List<PublicationBookmark>,
+    canSearchPageText: Boolean,
     pageLabel: String,
     onCloseControls: () -> Unit,
     onCloseReader: () -> Unit,
     onPageChange: (Int) -> Unit,
     onPreviousPage: () -> Unit,
     onNextPage: () -> Unit,
+    onAddBookmark: () -> Unit,
+    onShowBookmarks: () -> Unit,
+    onShowSearch: () -> Unit,
     onSetPageDisplayMode: (PageDisplayMode) -> Unit,
     onToggleDirection: () -> Unit,
     onSetGuidedMode: (Boolean) -> Unit,
@@ -161,6 +168,11 @@ internal fun ReaderControlsOverlay(
                         onPrevious = onPreviousPage,
                         onNext = onNextPage,
                     )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = onAddBookmark, enabled = !state.isLoading) { Text("Marcar página") }
+                        TextButton(onClick = onShowBookmarks) { Text("Marcadores ${pageBookmarks.size}") }
+                        if (canSearchPageText) TextButton(onClick = onShowSearch) { Text("Buscar texto") }
+                    }
                     SectionLabel("Modo de página")
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         PageModeChoice("Uma página", PageDisplayMode.SINGLE_PAGE, state.pageDisplayMode, Modifier.weight(1f), onSetPageDisplayMode)
@@ -170,7 +182,10 @@ internal fun ReaderControlsOverlay(
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                         DirectionChoice(direction, Modifier.weight(1f), onToggleDirection)
                         Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Zoom dos balões", color = ReaderInk, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text(
+                                if (state.documentFormatId == "PDF") "Detectar balões" else "Zoom dos balões",
+                                color = ReaderInk, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                            )
                             Switch(checked = isGuidedMode, onCheckedChange = onSetGuidedMode, modifier = Modifier.semantics { contentDescription = "Zoom dos balões" })
                         }
                     }
@@ -179,11 +194,7 @@ internal fun ReaderControlsOverlay(
                             Text("Fundo da leitura", color = ReaderInk, fontSize = 13.sp, fontWeight = FontWeight.Medium)
                             Text(background.label, color = ReaderMuted, fontSize = 11.sp)
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            ReaderCanvasBackground.entries.forEach { option ->
-                                BackgroundChoice(option, selected = option == background, onClick = { onSetCanvasBackground(option) })
-                            }
-                        }
+                        ReaderBackgroundChoices(background, onSetCanvasBackground)
                     }
                     TextButton(onClick = { advancedExpanded = !advancedExpanded }, contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 2.dp, vertical = 2.dp)) {
                         Text(if (!advancedExpanded) "Mais ajustes  ﹀" else "Mais ajustes  ︿", color = ReaderMuted, fontSize = 12.sp)
@@ -267,7 +278,7 @@ private fun PageProgressControl(
 private fun PageModeChoice(label: String, mode: PageDisplayMode, selected: PageDisplayMode, modifier: Modifier, onSelect: (PageDisplayMode) -> Unit) {
     val isSelected = mode == selected
     Surface(
-        modifier = modifier.heightIn(min = 48.dp).semantics { contentDescription = label; role = Role.RadioButton }
+        modifier = modifier.heightIn(min = 48.dp).semantics { contentDescription = label; role = Role.RadioButton; this.selected = isSelected }
             .clickable(role = Role.RadioButton, onClick = { onSelect(mode) }),
         shape = RoundedCornerShape(12.dp),
         color = if (isSelected) ReaderAccent else Color(0xFFF1EADF),
@@ -280,7 +291,7 @@ private fun PageModeChoice(label: String, mode: PageDisplayMode, selected: PageD
 }
 
 @Composable
-private fun DirectionChoice(label: String, modifier: Modifier, onToggle: () -> Unit) {
+internal fun DirectionChoice(label: String, modifier: Modifier = Modifier, onToggle: () -> Unit) {
     Surface(
         modifier = modifier.heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onToggle)
             .semantics { contentDescription = "Direção da leitura: $label. Toque para alternar." },
@@ -296,11 +307,23 @@ private fun DirectionChoice(label: String, modifier: Modifier, onToggle: () -> U
 }
 
 @Composable
+internal fun ReaderBackgroundChoices(selected: ReaderCanvasBackground, onSelect: (ReaderCanvasBackground) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+        ReaderCanvasBackground.entries.forEach { option ->
+            BackgroundChoice(option, selected = option == selected, onClick = { onSelect(option) })
+        }
+    }
+}
+
+@Composable
 private fun BackgroundChoice(option: ReaderCanvasBackground, selected: Boolean, onClick: () -> Unit) {
     val borderColor = if (selected) ReaderAccent else Color(0xFFBDB5A9)
     Box(
-        modifier = Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.RadioButton, onClick = onClick)
-            .semantics { contentDescription = "Fundo ${option.label}${if (selected) ", selecionado" else ""}" },
+        modifier = Modifier.size(48.dp).clip(CircleShape).semantics {
+            contentDescription = "Fundo ${option.label}${if (selected) ", selecionado" else ""}"
+            role = Role.RadioButton
+            this.selected = selected
+        }.clickable(role = Role.RadioButton, onClick = onClick),
         contentAlignment = Alignment.Center,
     ) {
         Surface(Modifier.size(32.dp), shape = CircleShape, color = option.color, border = BorderStroke(if (selected) 3.dp else 1.dp, borderColor)) {}

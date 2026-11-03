@@ -10,13 +10,13 @@ object PublicationManifestStore {
     fun save(publication: ImportedPublication) {
         val chapters = JSONArray()
         publication.chapters.forEach { chapter ->
-            chapters.put(JSONObject().put("href", chapter.href).put("title", chapter.title))
+            chapters.put(JSONObject().put("href", chapter.href).put("title", chapter.title).put("estimatedLength", chapter.estimatedLength))
         }
         val coverPath = publication.coverFile?.canonicalFile
             ?.takeIf { it.path.startsWith(publication.root.canonicalPath + File.separator) }
             ?.relativeTo(publication.root.canonicalFile)?.path
         val json = JSONObject()
-            .put("version", 1)
+            .put("version", 3)
             .put("format", publication.formatId)
             .put("title", publication.title)
             .put("author", publication.author)
@@ -29,17 +29,28 @@ object PublicationManifestStore {
                 .put("typography", publication.capabilities.typography)
                 .put("bookmarks", publication.capabilities.bookmarks)
                 .put("columns", publication.capabilities.columns)
-                .put("guidedRegions", publication.capabilities.guidedRegions))
+                .put("guidedRegions", publication.capabilities.guidedRegions)
+                .put("textSelection", publication.capabilities.textSelection)
+                .put("highlights", publication.capabilities.highlights)
+                .put("readingDirection", publication.capabilities.readingDirection))
         File(publication.root, MANIFEST_FILE).writeText(json.toString(), Charsets.UTF_8)
     }
 
     fun load(root: File): ImportedPublication? = runCatching {
         val json = JSONObject(File(root, MANIFEST_FILE).readText(Charsets.UTF_8))
-        require(json.optInt("version") == 1)
+        require(json.optInt("version") in 1..3)
         val chaptersJson = json.getJSONArray("chapters")
         val chapters = (0 until chaptersJson.length()).map { index ->
             val chapter = chaptersJson.getJSONObject(index)
-            PublicationChapter(chapter.getString("href"), chapter.getString("title"))
+            val href = chapter.getString("href")
+            val savedLength = chapter.optInt("estimatedLength", 0)
+            val migratedLength = if (savedLength > 0) savedLength else runCatching {
+                val base = root.canonicalFile
+                val content = File(base, href).canonicalFile
+                require(content.path.startsWith(base.path + File.separator) && content.isFile)
+                org.jsoup.Jsoup.parse(content, "UTF-8").text().length.coerceAtLeast(1)
+            }.getOrDefault(1)
+            PublicationChapter(href, chapter.getString("title"), migratedLength)
         }
         require(chapters.isNotEmpty())
         val cover = json.optString("cover").takeIf(String::isNotBlank)?.let { relative ->
@@ -61,8 +72,11 @@ object PublicationManifestStore {
                 textSearch = capabilityJson.optBoolean("textSearch", true),
                 typography = capabilityJson.optBoolean("typography", true),
                 bookmarks = capabilityJson.optBoolean("bookmarks", true),
-                columns = capabilityJson.optBoolean("columns", json.getString("format") == "EPUB"),
+                columns = json.getString("format") == "MOBI" || capabilityJson.optBoolean("columns", json.getString("format") == "EPUB"),
                 guidedRegions = capabilityJson.optBoolean("guidedRegions", false),
+                textSelection = capabilityJson.optBoolean("textSelection", true),
+                highlights = capabilityJson.optBoolean("highlights", true),
+                readingDirection = capabilityJson.optBoolean("readingDirection", true),
             ),
         )
     }.getOrNull()

@@ -99,8 +99,11 @@ class EpubImporter : PublicationImporter {
                     if (!chapterFile.isFile || chapterFile.length() > MAX_CHAPTER_BYTES) return@mapNotNull null
                     val sanitized = sanitizeHtml(chapterFile.readText(Charsets.UTF_8))
                     chapterFile.writeText(sanitized, Charsets.UTF_8)
-                    PublicationChapter(href, tocTitles[href]?.takeIf(String::isNotBlank)
-                        ?: titleFromHref(href).ifBlank { title })
+                    PublicationChapter(
+                        href,
+                        tocTitles[href]?.takeIf(String::isNotBlank) ?: titleFromHref(href).ifBlank { title },
+                        Jsoup.parse(sanitized).text().length.coerceAtLeast(1),
+                    )
                 }
                 if (chapters.isEmpty()) throw UnsupportedPublicationException("Este EPUB não tem capítulos de texto compatíveis.")
 
@@ -230,10 +233,11 @@ class MobiImporter : PublicationImporter {
         try {
             val decoded = decodePalmDoc(file)
             val chapter = File(destination, "chapter-000.xhtml")
-            chapter.writeText(EpubImporter.sanitizeHtml(decoded), Charsets.UTF_8)
+            val sanitized = EpubImporter.sanitizeHtml(decoded)
+            chapter.writeText(sanitized, Charsets.UTF_8)
             val title = fallbackTitle.ifBlank { file.nameWithoutExtension.ifBlank { "Livro MOBI" } }
-            return ImportedPublication(formatId, title, null, listOf(PublicationChapter(chapter.name, title)), destination, null,
-                capabilities = PublicationCapabilities(typography = true, textSearch = true, bookmarks = true))
+            return ImportedPublication(formatId, title, null, listOf(PublicationChapter(chapter.name, title, Jsoup.parse(sanitized).text().length.coerceAtLeast(1))), destination, null,
+                capabilities = PublicationCapabilities(typography = true, textSearch = true, bookmarks = true, columns = true))
         } catch (error: UnsupportedPublicationException) {
             destination.deleteRecursively()
             throw error

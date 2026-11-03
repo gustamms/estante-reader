@@ -1,5 +1,6 @@
 package com.estante.reader
 
+import android.app.Activity
 import android.annotation.SuppressLint
 import android.graphics.Color as AndroidColor
 import android.net.Uri
@@ -55,8 +56,12 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -68,8 +73,14 @@ import com.estante.reader.core.publication.PublicationCapabilities
 import com.estante.reader.core.publication.PublicationSearchResult
 import com.estante.reader.core.publication.BookColumnMode
 import com.estante.reader.core.publication.PublicationResourceMimeType
+import com.estante.reader.core.publication.publicationGlobalProgress
+import com.estante.reader.core.publication.publicationLocationAtProgress
 import java.io.File
 import java.net.URLDecoder
+import com.estante.reader.core.guided.ReadingDirection
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -87,6 +98,7 @@ internal fun BookReaderScreen(
     marginsDp: Float,
     columnMode: BookColumnMode,
     background: ReaderCanvasBackground,
+    readingDirection: ReadingDirection = ReadingDirection.LEFT_TO_RIGHT,
     capabilities: PublicationCapabilities,
     bookmarks: List<PublicationBookmark>,
     highlights: List<BookHighlightEntity>,
@@ -111,6 +123,7 @@ internal fun BookReaderScreen(
     onPendingHighlightConsumed: (String) -> Unit,
     onSearch: (String) -> Unit,
     onOpenSearchResult: (PublicationSearchResult) -> Unit,
+    onToggleDirection: () -> Unit = {},
 ) {
     var controlsVisible by remember(bookId) { mutableStateOf(false) }
     var showContents by remember(bookId) { mutableStateOf(false) }
@@ -121,6 +134,12 @@ internal fun BookReaderScreen(
     var searchQuery by remember(bookId) { mutableStateOf("") }
     val chapter = chapters.getOrNull(chapterIndex)
     val chapterCount = chapters.size.coerceAtLeast(1)
+    val totalProgress = publicationGlobalProgress(chapters, chapterIndex, progression)
+    var sliderProgress by remember(bookId) { androidx.compose.runtime.mutableFloatStateOf(totalProgress) }
+    var sliderDragging by remember(bookId) { mutableStateOf(false) }
+    LaunchedEffect(chapterIndex, progression) {
+        if (!sliderDragging) sliderProgress = totalProgress
+    }
     var visiblePage by remember(bookId, chapter?.href) { mutableStateOf(1 to 1) }
     var chapterLoadError by remember(bookId, chapter?.href) { mutableStateOf<String?>(null) }
     val chapterUrl = remember(bookId, chapter?.href) {
@@ -134,6 +153,7 @@ internal fun BookReaderScreen(
     }
     val latestOnGoToChapter by rememberUpdatedState(goToChapter)
     val latestChapterIndex by rememberUpdatedState(chapterIndex)
+    val latestReadingDirection by rememberUpdatedState(readingDirection)
     val setControls: (Boolean) -> Unit = { visible -> controlsVisible = visible }
     val latestToggleControls by rememberUpdatedState(setControls)
     val latestControlsVisible by rememberUpdatedState(controlsVisible)
@@ -145,6 +165,9 @@ internal fun BookReaderScreen(
     val pageTurn = remember(bookId) { BookPageTurnController() }
     val snackbarHostState = remember(bookId) { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val localView = LocalView.current
+    val window = (context as? Activity)?.window
 
     BackHandler {
         when {
@@ -156,6 +179,12 @@ internal fun BookReaderScreen(
             controlsVisible -> controlsVisible = false
             else -> onClose()
         }
+    }
+    DisposableEffect(window, localView) {
+        val insets = window?.let { WindowCompat.getInsetsController(it, localView) }
+        insets?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        insets?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose { insets?.show(WindowInsetsCompat.Type.systemBars()) }
     }
 
     BoxWithConstraints(Modifier.fillMaxSize().background(background.color).safeDrawingPadding()) {
@@ -184,7 +213,11 @@ internal fun BookReaderScreen(
                 settings.displayZoomControls = false
                 settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 addJavascriptInterface(BookProgressBridge(
-                    report = { reportedChapter, value -> post { latestOnProgress(reportedChapter, value) } },
+                    report = { reportedChapter, value -> post {
+                        if (reportedChapter == latestChapterIndex && pageTurn.turn == null) {
+                            latestOnProgress(reportedChapter, value)
+                        }
+                    } },
                     turnChapter = { direction -> post {
                         val next = latestChapterIndex + direction
                         if (next in chapters.indices) latestOnProgress(next, if (direction > 0) 0f else 1f)
@@ -193,7 +226,8 @@ internal fun BookReaderScreen(
                     requestTurn = { direction -> post {
                         pageTurn.request(this, direction, latestChapterIndex + direction in chapters.indices)
                     } },
-                    ready = { post { pageTurn.chapterReady(this) } },
+                    ready = {},
+                    turnInProgress = { pageTurn.turn != null },
                 ), "EstanteProgress")
                 addJavascriptInterface(BookSelectionBridge(
                     reportSelection = { href, text, start, end, prefix, suffix ->
@@ -213,16 +247,27 @@ internal fun BookReaderScreen(
                     highlights = { latestHighlights },
                     pendingHighlight = { latestPendingHighlight },
                     onPendingHighlightConsumed = { id -> latestOnPendingConsumed(id) },
+                    onChapterReady = { view -> pageTurn.chapterReady(view) },
                     onChapterLoadStarted = { chapterLoadError = null },
                     onChapterLoadError = { message -> pageTurn.cancel(); chapterLoadError = message },
                 )
                 addOnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
                     if (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop) pageTurn.cancel()
                 }
+                val dragTouch = BookDragTouchHandler(
+                    pageTurn,
+                    canChangeChapter = { direction -> latestChapterIndex + direction in chapters.indices },
+                    chapterRestorer = {
+                        val sourceChapter = latestChapterIndex
+                        { value: Float -> latestOnProgress(sourceChapter, value) }
+                    },
+                    readingDirection = { latestReadingDirection },
+                )
                 var downX = 0f
                 var downY = 0f
                 var downTime = 0L
                 setOnTouchListener { _, event ->
+                    if (dragTouch.onTouch(this, event, !latestControlsVisible)) return@setOnTouchListener true
                     when (event.actionMasked) {
                         android.view.MotionEvent.ACTION_DOWN -> {
                             downX = event.x
@@ -234,11 +279,14 @@ internal fun BookReaderScreen(
                             val dy = event.y - downY
                             val moved = kotlin.math.abs(event.x - downX) > 12 || kotlin.math.abs(event.y - downY) > 12
                             val quickTap = event.eventTime - downTime < 280
-                            if (quickTap && !moved && !latestControlsVisible && (event.x < width * 0.25f || event.x > width * 0.75f)) {
-                                evaluateJavascript("if(window.getSelection().isCollapsed && window.estanteTurnPage) window.estanteTurnPage(${if (event.x > width * 0.75f) 1 else -1});", null)
+                            val edgeDirection = ReaderInteraction.edgeTurnDirection(event.x, width.toFloat(), latestReadingDirection)
+                            if (quickTap && !moved && !latestControlsVisible && edgeDirection != null) {
+                                cancelBookPointer(event)
+                                evaluateJavascript("if(window.getSelection().isCollapsed && window.estanteTurnPage) window.estanteTurnPage($edgeDirection);", null)
                                 return@setOnTouchListener true
                             }
-                            if (quickTap && !moved && event.x in width * 0.30f..width * 0.70f && event.y in height * 0.34f..height * 0.68f) {
+                            if (quickTap && !moved && ReaderInteraction.isCenterTap(event.x, event.y, width.toFloat(), height.toFloat())) {
+                                cancelBookPointer(event)
                                 latestToggleControls(!latestControlsVisible)
                                 return@setOnTouchListener true
                             }
@@ -263,6 +311,7 @@ internal fun BookReaderScreen(
     BookPageTurnOverlay(
         pageTurn, background,
         Modifier.then(if (widePanelOpen) Modifier.padding(end = panelWidth) else Modifier),
+        readingDirection,
     )
 
     chapterLoadError?.let { message ->
@@ -293,7 +342,7 @@ internal fun BookReaderScreen(
     val currentWebView = webView.value
     DisposableEffect(currentWebView) {
         onDispose {
-            pageTurn.cancel()
+            pageTurn.cancel(restore = false)
             currentWebView?.apply {
                 stopLoading()
                 removeJavascriptInterface("EstanteProgress")
@@ -348,7 +397,7 @@ internal fun BookReaderScreen(
             shadowElevation = 16.dp,
         ) {
             Column(
-                Modifier.fillMaxWidth().heightIn(max = 470.dp).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
+                Modifier.fillMaxWidth().heightIn(max = minOf(380.dp, maxHeight * 0.60f)).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -367,13 +416,15 @@ internal fun BookReaderScreen(
                         colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFFA95138)),
                     ) { Text("Próximo") }
                 }
-                val totalProgress = ((chapterIndex + progression) / chapterCount).coerceIn(0f, 1f)
                 Slider(
-                    value = totalProgress,
+                    value = sliderProgress,
                     onValueChange = { value ->
-                        val absolute = value * chapterCount
-                        val newIndex = absolute.toInt().coerceIn(0, chapterCount - 1)
-                        val newProgress = if (newIndex == chapterCount - 1 && value >= 1f) 1f else absolute - newIndex
+                        sliderDragging = true
+                        sliderProgress = value
+                    },
+                    onValueChangeFinished = {
+                        val value = sliderProgress.coerceIn(0f, 1f)
+                        val (newIndex, newProgress) = publicationLocationAtProgress(chapters, value)
                         if (newIndex == chapterIndex) {
                             webView.value?.evaluateJavascript(
                                 "window.estanteRestoreProgress?.($newProgress);",
@@ -381,6 +432,7 @@ internal fun BookReaderScreen(
                             )
                         }
                         latestOnProgress(newIndex, newProgress)
+                        sliderDragging = false
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -390,13 +442,15 @@ internal fun BookReaderScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Button(onClick = { showContents = true }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFA95138))) {
+                    if (capabilities.tableOfContents) Button(onClick = { showContents = true }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFA95138))) {
                         Text("Sumário")
                     }
-                    TextButton(onClick = { showSearch = !showSearch; searchQuery = "" }) { Text("Buscar") }
-                    TextButton(onClick = { onAddBookmark(); showBookmarks = true }) { Text("Marcar") }
-                    TextButton(onClick = { showBookmarks = true }) { Text("Marcadores ${bookmarks.size}") }
-                    TextButton(onClick = { showHighlightsPanel = true; controlsVisible = false }) { Text("Grifos ${highlights.size}") }
+                    if (capabilities.textSearch) TextButton(onClick = { showSearch = !showSearch; searchQuery = "" }) { Text("Buscar") }
+                    if (capabilities.bookmarks) {
+                        TextButton(onClick = { onAddBookmark(); showBookmarks = true }) { Text("Marcar") }
+                        TextButton(onClick = { showBookmarks = true }) { Text("Marcadores ${bookmarks.size}") }
+                    }
+                    if (capabilities.highlights) TextButton(onClick = { showHighlightsPanel = true; controlsVisible = false }) { Text("Grifos ${highlights.size}") }
                 }
                 if (showSearch) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -420,6 +474,10 @@ internal fun BookReaderScreen(
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (capabilities.readingDirection) DirectionChoice(
+                            if (readingDirection == ReadingDirection.LEFT_TO_RIGHT) "Esquerda → direita" else "Direita → esquerda",
+                            Modifier.weight(1f), onToggleDirection,
+                        )
                     if (capabilities.typography) {
                         Text("Aa", color = Color(0xFF292722), fontSize = 15.sp)
                         TextButton(onClick = { onFontSizeChange(fontSizeSp - 1f) }, enabled = fontSizeSp > 16f) { Text("−") }
@@ -453,15 +511,9 @@ internal fun BookReaderScreen(
                         Slider(value = marginsDp, onValueChange = onMarginsChange, valueRange = 12f..48f, modifier = Modifier.weight(1f))
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Fundo", color = Color(0xFF706B62), fontSize = 12.sp)
-                    ReaderCanvasBackground.entries.forEach { option ->
-                        Box(
-                            Modifier.size(28.dp).clip(RoundedCornerShape(50)).background(option.color)
-                                .border(if (option == background) 2.dp else 1.dp, if (option == background) Color(0xFFA95138) else Color(0xFFAEA99F), RoundedCornerShape(50))
-                                .clickable { onBackgroundChange(option) }
-                        )
-                    }
+                    ReaderBackgroundChoices(background, onBackgroundChange)
                 }
             }
         }
@@ -570,7 +622,9 @@ private class BookProgressBridge(
     private val pagination: (Int, Int) -> Unit,
     private val requestTurn: (Int) -> Unit,
     private val ready: () -> Unit,
+    private val turnInProgress: () -> Boolean,
 ) {
+    @JavascriptInterface fun isTurning(): Boolean = turnInProgress()
     @JavascriptInterface fun onTurnRequested(direction: Int) { if (direction == -1 || direction == 1) requestTurn(direction) }
     @JavascriptInterface fun onReady() { ready() }
     @JavascriptInterface fun onChapterBoundary(direction: Int) { if (direction == -1 || direction == 1) turnChapter(direction) }
@@ -617,6 +671,7 @@ private class BookWebViewClient(
     private val highlights: () -> List<BookHighlightEntity>,
     private val pendingHighlight: () -> BookHighlightEntity?,
     private val onPendingHighlightConsumed: (String) -> Unit,
+    private val onChapterReady: (WebView) -> Unit,
     private val onChapterLoadStarted: () -> Unit,
     private val onChapterLoadError: (String) -> Unit,
 ) : WebViewClient() {
@@ -661,8 +716,14 @@ private class BookWebViewClient(
         view?.apply {
             val chapter = currentChapter()
             val target = pendingHighlight()?.takeIf { it.chapterIndex == chapter }
+            val savedProgress = progression()
             applyReaderStyle(style(), chapter, highlights(), target, onPendingHighlightConsumed)
-            if (target == null) postDelayed({ scrollToProgress(progression()) }, 120)
+            postDelayed({
+                if (this.url == url) {
+                    if (target == null) scrollToProgress(savedProgress) { onChapterReady(this) }
+                    else onChapterReady(this)
+                }
+            }, 120)
         }
     }
 
@@ -764,12 +825,12 @@ internal fun WebView.applyReaderStyle(
           window.estanteLayoutPages=layoutPages;layoutPages();
           if(window.estanteProgressTimer){clearInterval(window.estanteProgressTimer);}
           function pageCount(){var count=Math.max(1,Math.ceil((content.scrollWidth-1)/window.estantePageWidth));var end=document.getElementById('estante-page-end');if(!end){end=document.createElement('div');end.id='estante-page-end';end.setAttribute('aria-hidden','true');pager.appendChild(end);}end.style.cssText='position:absolute;top:0;left:'+(count*window.estantePageWidth-1)+'px;width:1px;height:1px;pointer-events:none;';return count;}
-          function reportPage(){var count=pageCount(),page=Math.min(count-1,Math.round(pager.scrollLeft/window.estantePageWidth));window.estanteProgressValue=count>1?page/(count-1):0;EstanteProgress.onPagination(page+1,count);EstanteProgress.onProgress($chapterIndex,window.estanteProgressValue);}
-          window.estanteRestoreProgress=function(p){var page=Math.round(Math.max(0,Math.min(1,p))*(pageCount()-1));pager.scrollTo({left:page*window.estantePageWidth,top:0,behavior:'instant'});reportPage();requestAnimationFrame(function(){if(EstanteProgress.onReady)EstanteProgress.onReady();});};
-          window.estanteCommitTurnPage=function(direction){var next=Math.round(pager.scrollLeft/window.estantePageWidth)+direction,count=pageCount();if(next<0||next>=count)return 'boundary';pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:'instant'});reportPage();return 'turned';};
-          window.estanteTurnPage=function(direction){if(!getSelection().isCollapsed)return;if(EstanteProgress.onTurnRequested){EstanteProgress.onTurnRequested(direction);}else if(window.estanteCommitTurnPage(direction)==='boundary'){EstanteProgress.onChapterBoundary(direction);}};
+          function reportPage(){if(window.estantePreviewActive)return;var count=pageCount(),page=Math.min(count-1,Math.round(pager.scrollLeft/window.estantePageWidth));window.estanteProgressValue=count>1?page/(count-1):0;EstanteProgress.onPagination(page+1,count);EstanteProgress.onProgress($chapterIndex,window.estanteProgressValue);}
+          window.estanteRestoreProgress=function(p){window.estantePreviewActive=false;var page=Math.round(Math.max(0,Math.min(1,p))*(pageCount()-1));pager.scrollTo({left:page*window.estantePageWidth,top:0,behavior:'instant'});reportPage();requestAnimationFrame(function(){if(EstanteProgress.onReady)EstanteProgress.onReady();});};
+          window.estanteCommitTurnPage=function(direction,preview){var next=Math.round(pager.scrollLeft/window.estantePageWidth)+direction,count=pageCount();if(next<0||next>=count){window.estantePreviewActive=true;return 'boundary';}window.estantePreviewActive=!!preview;pager.scrollTo({left:next*window.estantePageWidth,top:0,behavior:'instant'});reportPage();return 'turned';};
+          window.estanteConfirmTurnPage=function(){window.estantePreviewActive=false;reportPage();};
+          window.estanteTurnPage=function(direction){if(!getSelection().isCollapsed||(EstanteProgress.isTurning&&EstanteProgress.isTurning()))return;if(EstanteProgress.onTurnRequested){EstanteProgress.onTurnRequested(direction);}else if(window.estanteCommitTurnPage(direction)==='boundary'){EstanteProgress.onChapterBoundary(direction);}};
           window.estanteProgressTimer=setInterval(reportPage,1200);
-          if(!window.estanteSwipeListener){var startX=0,startY=0,startTime=0;document.addEventListener('touchstart',function(e){if(e.touches.length!==1)return;startX=e.touches[0].clientX;startY=e.touches[0].clientY;startTime=Date.now();},{passive:true});document.addEventListener('touchend',function(e){if(!e.changedTouches.length)return;var dx=e.changedTouches[0].clientX-startX,dy=e.changedTouches[0].clientY-startY;if(Date.now()-startTime<600&&Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)*1.5&&getSelection().isCollapsed){e.preventDefault();window.estanteTurnPage(dx<0?1:-1);}},{passive:false});window.estanteSwipeListener=true;}
           if(!window.estanteResizeHandler){window.estanteResizeHandler=function(){var p=window.estanteProgressValue||0;window.estanteLayoutPages();requestAnimationFrame(function(){window.estanteRestoreProgress(p);});};addEventListener('resize',window.estanteResizeHandler);}
           if(hadLayout&&previousProgress!=null&&$target===null)requestAnimationFrame(function(){window.estanteRestoreProgress(previousProgress);});
           requestAnimationFrame(function(){EstanteProgress.onPagination(Math.round(pager.scrollLeft/window.estantePageWidth)+1,pageCount());});
@@ -813,10 +874,10 @@ internal fun WebView.applyReaderStyle(
     evaluateJavascript(script, null)
 }
 
-private fun WebView.scrollToProgress(progression: Float) {
+private fun WebView.scrollToProgress(progression: Float, onRestored: () -> Unit = {}) {
     evaluateJavascript(
         "window.estanteRestoreProgress?.(${progression.coerceIn(0f, 1f)});",
-        null,
+        { onRestored() },
     )
 }
 

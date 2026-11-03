@@ -103,6 +103,98 @@ class BookReaderRegressionAndroidTest {
         }
     }
 
+    @Test fun draggingTracksTheHeldPointerAndCanReturnToTheOriginalPage() {
+        ReaderHarness(curl = true).use { h ->
+            h.load(SAMPLE); h.style(24f, false)
+            h.js("estanteRestoreProgress(0)")
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .85f, .73f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .71f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .7f, .68f)
+            h.await("Drag destination is rendered") { h.controller.turn?.after != null }
+            val turn = requireNotNull(h.controller.turn)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .52f, .62f)
+            h.await("Curl follows pointer before release") { turn.animation.progress > .1f }
+            repeat(6) { h.settle() }
+            assertEquals("Holding must not automatically complete the page turn", 1, turn.animation.current)
+            assertNotNull(h.controller.turn)
+            assertEquals("A held preview must not save the next page", 0.0, h.js("estanteProgressValue").toDouble(), .001)
+            val middle = turn.animation.progress
+            h.deviceScreenshot("curl-drag-held.png")
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .25f, .58f)
+            h.await("Moving farther must curl farther") { turn.animation.progress > middle + .08f }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .82f, .73f)
+            h.await("Returning the finger must uncurl the sheet") { turn.animation.progress < middle - .08f }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .88f, .75f)
+            h.settle()
+            h.pointer(android.view.MotionEvent.ACTION_UP, .9f, .75f)
+            h.await("Cancelled drag restores the original page") { h.controller.turn == null }
+            assertEquals(0, h.js("Math.round(document.getElementById('estante-pages').scrollLeft)").toInt())
+            assertEquals(0.0, h.js("estanteProgressValue").toDouble(), .001)
+        }
+    }
+
+    @Test fun draggingCommitsBothDirectionsAndSystemCancellationRestoresProgress() {
+        ReaderHarness(curl = true).use { h ->
+            h.load(SAMPLE); h.style(24f, false)
+            h.js("estanteRestoreProgress(0)")
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .85f, .73f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .71f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .7f, .68f)
+            h.await("Forward drag ready") { h.controller.turn?.after != null }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .2f, .55f)
+            h.settle()
+            h.pointer(android.view.MotionEvent.ACTION_UP, .1f, .52f)
+            h.await("Forward drag completes") { h.controller.turn == null }
+            assertEquals(1, h.js("Math.round(document.getElementById('estante-pages').scrollLeft/estantePageWidth)").toInt())
+            assertTrue(h.js("estanteProgressValue").toDouble() > 0)
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .1f, .75f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .3f, .68f)
+            h.await("Backward drag ready") { h.controller.turn?.after != null }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .55f)
+            h.settle()
+            h.pointer(android.view.MotionEvent.ACTION_UP, .9f, .52f)
+            h.await("Backward drag completes") { h.controller.turn == null }
+            assertEquals(0, h.js("Math.round(document.getElementById('estante-pages').scrollLeft)").toInt())
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .85f, .73f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .71f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .7f, .68f)
+            h.await("Cancelled drag ready") { h.controller.turn?.after != null }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .2f, .55f)
+            h.settle()
+            h.pointer(android.view.MotionEvent.ACTION_CANCEL, .2f, .55f)
+            h.await("System cancellation rolls back") { h.controller.turn == null }
+            assertEquals(0.0, h.js("estanteProgressValue").toDouble(), .001)
+            assertEquals(0, h.js("Math.round(document.getElementById('estante-pages').scrollLeft)").toInt())
+            h.quickSwipe()
+            h.await("A fast swipe must be retained while the destination renders") { h.controller.turn?.after != null }
+            h.await("Fast swipe completes") { h.controller.turn == null }
+            assertEquals(1, h.js("Math.round(document.getElementById('estante-pages').scrollLeft/estantePageWidth)").toInt())
+        }
+    }
+
+    @Test fun textSelectionAndLongPressAreNotPageTurnGestures() {
+        ReaderHarness(curl = true).use { h ->
+            h.load(SAMPLE); h.style(24f, false)
+            h.js("estanteRestoreProgress(0);var r=document.createRange();r.selectNodeContents(document.querySelector('p.prose'));var s=getSelection();s.removeAllRanges();s.addRange(r)")
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .7f)
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .65f, .65f)
+            h.settle()
+            assertNull("Existing selection must keep the gesture in WebView", h.controller.turn)
+            h.pointer(android.view.MotionEvent.ACTION_UP, .65f, .65f)
+            h.js("getSelection().removeAllRanges()")
+            h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+            repeat(4) { h.settle() }
+            h.pointer(android.view.MotionEvent.ACTION_MOVE, .65f, .65f)
+            assertNull("Long press must remain available for highlighting", h.controller.turn)
+            h.pointer(android.view.MotionEvent.ACTION_UP, .65f, .65f)
+            assertEquals(0.0, h.js("estanteProgressValue").toDouble(), .001)
+        }
+    }
+
     @Test fun suppliedEpubImportsAndRendersWithReadableTypography() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val source = File(context.filesDir, "reader-regression.epub")
@@ -131,7 +223,27 @@ class BookReaderRegressionAndroidTest {
                     h.settle()
                     assertTrue("Production bridge must advance a page", h.js("document.getElementById('estante-pages').scrollLeft").toDouble() > 0)
                     // Allow the curl to finish, then cross a real spine boundary.
-                    repeat(5) { h.settle() }
+                    h.awaitJs("!EstanteProgress.isTurning()")
+                    h.awaitJs("getSelection().isCollapsed")
+                    val savedProgress = h.js("estanteProgressValue").toDouble()
+                    h.pointer(android.view.MotionEvent.ACTION_DOWN, .9f, .75f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .85f, .73f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .8f, .71f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .65f, .68f)
+                    h.awaitJs("window.estantePreviewActive===true")
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .4f, .6f)
+                    repeat(3) { h.settle() }
+                    h.js("EstanteProgress.onProgress($index,1)")
+                    h.settle()
+                    assertEquals("A stale progress callback must not save a preview", savedProgress, h.publishedPosition().second.toDouble(), .001)
+                    assertEquals(savedProgress, h.js("estanteProgressValue").toDouble(), .001)
+                    h.deviceScreenshot("epub-drag-${if (double) "double" else "single"}.png")
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .88f, .75f)
+                    h.settle(); h.settle()
+                    h.pointer(android.view.MotionEvent.ACTION_UP, .9f, .75f)
+                    h.awaitJs("window.estantePreviewActive===false")
+                    h.awaitJs("!EstanteProgress.isTurning()")
+                    assertEquals(savedProgress, h.js("estanteProgressValue").toDouble(), .001)
                     val oldPath = h.js("location.pathname")
                     h.js("estanteRestoreProgress(1)")
                     h.js("estanteTurnPage(1)")
@@ -141,8 +253,29 @@ class BookReaderRegressionAndroidTest {
                         if (h.js("location.pathname") != oldPath && h.js("typeof estanteRestoreProgress") == "\"function\"") { changed = true; break }
                     }
                     assertTrue("Production reader must open the next chapter", changed)
-                    repeat(5) { h.settle() }
+                    h.awaitJs("!EstanteProgress.isTurning()")
                     assertEquals(0.0, h.js("estanteProgressValue").toDouble(), 0.01)
+                    val nextPath = h.js("location.pathname")
+                    h.pointer(android.view.MotionEvent.ACTION_DOWN, .1f, .75f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .15f, .73f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .2f, .71f)
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .35f, .68f)
+                    for (attempt in 0..40) {
+                        h.settle()
+                        if (h.js("location.pathname") != nextPath) break
+                    }
+                    assertNotEquals("Backward drag previews previous chapter: ${h.js("JSON.stringify({turning:EstanteProgress.isTurning(),selected:!getSelection().isCollapsed,progress:estanteProgressValue})")}", nextPath, h.js("location.pathname"))
+                    h.awaitJs("estanteProgressValue===1")
+                    h.pointer(android.view.MotionEvent.ACTION_MOVE, .12f, .74f)
+                    h.settle(); h.settle()
+                    h.pointer(android.view.MotionEvent.ACTION_UP, .1f, .75f)
+                    for (attempt in 0..40) {
+                        h.settle()
+                        if (h.js("location.pathname") == nextPath) break
+                    }
+                    assertEquals("Cancelled chapter drag restores original chapter", nextPath, h.js("location.pathname"))
+                    h.awaitJs("!EstanteProgress.isTurning()")
+                    assertEquals(0.0, h.js("estanteProgressValue").toDouble(), .001)
                 }
             }
         } finally { root.deleteRecursively() }
@@ -156,11 +289,21 @@ class BookReaderRegressionAndroidTest {
         private var loaded = CountDownLatch(1)
         private var font = 24f
         private var double = false
+        private var publicationPosition = 0 to 0f
+        fun publishedPosition(): Pair<Int, Float> {
+            var result = 0 to 0f
+            inst.runOnMainSync { result = publicationPosition }
+            return result
+        }
         init {
             inst.runOnMainSync {
                 view = WebView(activity).apply {
                     settings.javaScriptEnabled = true
                     addJavascriptInterface(this@ReaderHarness, "EstanteProgress")
+                    if (curl) {
+                        val gestures = BookDragTouchHandler(controller, { true }, { { _: Float -> } })
+                        setOnTouchListener { _, event -> gestures.onTouch(this, event, true) }
+                    }
                     webViewClient = object : WebViewClient() {
                         override fun onPageFinished(v: WebView?, url: String?) {
                             if (url.orEmpty().endsWith("next.html")) {
@@ -181,6 +324,7 @@ class BookReaderRegressionAndroidTest {
         }
         @JavascriptInterface fun onPagination(page: Int, total: Int) {}
         @JavascriptInterface fun onProgress(chapter: Int, progression: Float) {}
+        @JavascriptInterface fun isTurning(): Boolean = controller.turn != null
         @JavascriptInterface fun onReady() { view.post { controller.chapterReady(view) } }
         @JavascriptInterface fun onTurnRequested(direction: Int) {
             view.post {
@@ -195,6 +339,7 @@ class BookReaderRegressionAndroidTest {
             var chapter by mutableStateOf(initialChapter)
             var progress by mutableStateOf(0f)
             inst.runOnMainSync {
+                (view.parent as? android.view.ViewGroup)?.removeView(view)
                 view.destroy()
                 activity.setContent {
                     Box(Modifier.width(width.dp).height(740.dp)) {
@@ -207,7 +352,7 @@ class BookReaderRegressionAndroidTest {
                             background = ReaderCanvasBackground.PAPER, capabilities = book.capabilities,
                             bookmarks = emptyList(), highlights = emptyList(), highlightColorId = "yellow",
                             pendingHighlight = null, searchResults = emptyList(), isSearching = false,
-                            onClose = {}, onProgress = { c, p -> chapter = c; progress = p },
+                            onClose = {}, onProgress = { c, p -> chapter = c; progress = p; publicationPosition = c to p },
                             onFontSizeChange = {}, onLineSpacingChange = {}, onMarginsChange = {},
                             onColumnsChange = {}, onBackgroundChange = {}, onAddBookmark = {},
                             onTextSelection = { _, _, _, _, _, _ -> }, onHighlightColorChange = {},
@@ -257,6 +402,14 @@ class BookReaderRegressionAndroidTest {
             inst.runOnMainSync { view.evaluateJavascript(script) { result = it; done.countDown() } }
             assertTrue(done.await(10, TimeUnit.SECONDS)); return result
         }
+        fun awaitJs(expression: String) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20)
+            while (System.nanoTime() < deadline) {
+                if (js(expression) == "true") return
+                Thread.sleep(40)
+            }
+            fail("JavaScript condition not reached: $expression; ${js("JSON.stringify({selection:!getSelection().isCollapsed,turning:EstanteProgress.isTurning(),preview:window.estantePreviewActive})")}")
+        }
         fun settle() {
             val done = CountDownLatch(1)
             inst.runOnMainSync { view.postDelayed({ done.countDown() }, 200) }
@@ -272,6 +425,34 @@ class BookReaderRegressionAndroidTest {
             }
             fail("$message: state=${js("JSON.stringify({ready:typeof estanteRestoreProgress,progress:window.estanteProgressValue})")}")
         }
+        private var pointerDownTime = 0L
+        fun pointer(action: Int, xFraction: Float, yFraction: Float) {
+            inst.runOnMainSync {
+                val now = android.os.SystemClock.uptimeMillis()
+                if (action == android.view.MotionEvent.ACTION_DOWN) pointerDownTime = now
+                val event = android.view.MotionEvent.obtain(
+                    pointerDownTime, now, action,
+                    view.width * xFraction, view.height * yFraction, 0,
+                ).apply { source = android.view.InputDevice.SOURCE_TOUCHSCREEN }
+                try { view.dispatchTouchEvent(event) } finally { event.recycle() }
+            }
+            Thread.sleep(40)
+        }
+        fun quickSwipe() {
+            inst.runOnMainSync {
+                val time = android.os.SystemClock.uptimeMillis()
+                listOf(
+                    Triple(android.view.MotionEvent.ACTION_DOWN, .9f, .75f),
+                    Triple(android.view.MotionEvent.ACTION_MOVE, .65f, .65f),
+                    Triple(android.view.MotionEvent.ACTION_MOVE, .1f, .55f),
+                    Triple(android.view.MotionEvent.ACTION_UP, .1f, .55f),
+                ).forEachIndexed { index, (action, x, y) ->
+                    val event = android.view.MotionEvent.obtain(time, time + index * 20, action, view.width * x, view.height * y, 0)
+                        .apply { source = android.view.InputDevice.SOURCE_TOUCHSCREEN }
+                    try { view.dispatchTouchEvent(event) } finally { event.recycle() }
+                }
+            }
+        }
         fun tapNext() {
             val location = IntArray(2)
             var x = 0f; var y = 0f
@@ -280,14 +461,15 @@ class BookReaderRegressionAndroidTest {
                 x = location[0] + view.width * .9f
                 y = location[1] + view.height * .5f
             }
-            val time = android.os.SystemClock.uptimeMillis()
-            val down = android.view.MotionEvent.obtain(time, time, android.view.MotionEvent.ACTION_DOWN, x, y, 0)
-            val up = android.view.MotionEvent.obtain(time, time + 50, android.view.MotionEvent.ACTION_UP, x, y, 0)
-            try { inst.sendPointerSync(down); Thread.sleep(50); inst.sendPointerSync(up) }
-            finally { down.recycle(); up.recycle() }
+            val result = inst.uiAutomation.executeShellCommand("input tap ${x.toInt()} ${y.toInt()}")
+            android.os.ParcelFileDescriptor.AutoCloseInputStream(result).use { it.readBytes() }
         }
         fun deviceScreenshot(name: String) {
             val bitmap = inst.uiAutomation.takeScreenshot()
+            val location = IntArray(2)
+            inst.runOnMainSync { view.getLocationOnScreen(location) }
+            val pixel = bitmap.getPixel(location[0] + 12, location[1] + 12)
+            assertTrue("Reader must be visible in the actual window", android.graphics.Color.red(pixel) < 250 || android.graphics.Color.green(pixel) < 250 || android.graphics.Color.blue(pixel) < 250)
             File(inst.targetContext.filesDir, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
         }
         fun screenshot(name: String) {
@@ -297,7 +479,8 @@ class BookReaderRegressionAndroidTest {
                 File(inst.targetContext.filesDir, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
             }
         }
-        override fun close() { inst.runOnMainSync { controller.cancel(); activity.finish(); view.destroy() } }
+        override fun close() {
+            inst.runOnMainSync { controller.cancel(); activity.finish(); view.destroy() } }
     }
 
     companion object {

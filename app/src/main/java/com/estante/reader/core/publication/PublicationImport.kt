@@ -20,9 +20,12 @@ data class PublicationCapabilities(
     val bookmarks: Boolean = false,
     val columns: Boolean = false,
     val guidedRegions: Boolean = false,
+    val textSelection: Boolean = true,
+    val highlights: Boolean = true,
+    val readingDirection: Boolean = true,
 )
 
-data class PublicationChapter(val href: String, val title: String)
+data class PublicationChapter(val href: String, val title: String, val estimatedLength: Int = 1)
 
 internal object PublicationResourceMimeType {
     fun resolve(relativePath: String, chapters: List<PublicationChapter>): String {

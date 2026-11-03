@@ -2,6 +2,8 @@ package com.estante.reader.core.archive
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.RectF
+import android.os.Build
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
 import java.io.ByteArrayOutputStream
@@ -19,6 +21,42 @@ class PdfPageDocument private constructor(
     private var closed = false
 
     override val pageCount: Int get() = documentPageCount
+
+    data class TextSearchResult(val pageIndex: Int, val snippet: String, val matches: List<RectF>)
+
+    /** Android exposes native PDF text search from API 35; scanned pages need OCR instead. */
+    fun searchText(query: String, maxResults: Int = 40): List<TextSearchResult>? = synchronized(rendererLock) {
+        check(!closed) { "O PDF já foi fechado." }
+        if (Build.VERSION.SDK_INT < 35) return@synchronized null
+        val term = query.trim()
+        if (term.isEmpty() || maxResults <= 0) return@synchronized emptyList()
+        buildList {
+            for (index in 0 until documentPageCount) {
+                if (size >= maxResults) break
+                val page = renderer.openPage(index)
+                try {
+                    val text = page.textContents.joinToString(" ") { it.text }.replace(Regex("\\s+"), " ")
+                    page.searchText(term).forEach { match ->
+                        if (size >= maxResults) return@forEach
+                        val start = match.textStartIndex.coerceIn(0, text.length)
+                        val snippetStart = (start - 50).coerceAtLeast(0)
+                        val snippetEnd = (start + term.length + 50).coerceAtMost(text.length)
+                        val bounds = match.bounds.map { rect ->
+                            RectF(
+                                (rect.left / page.width).coerceIn(0f, 1f),
+                                (rect.top / page.height).coerceIn(0f, 1f),
+                                (rect.right / page.width).coerceIn(0f, 1f),
+                                (rect.bottom / page.height).coerceIn(0f, 1f),
+                            )
+                        }
+                        add(TextSearchResult(index, text.substring(snippetStart, snippetEnd), bounds))
+                    }
+                } finally {
+                    page.close()
+                }
+            }
+        }
+    }
 
     override fun readPage(index: Int): ByteArray =
         readPage(index, MAX_PAGE_DIMENSION.toInt(), MAX_PAGE_PIXELS.toLong())
